@@ -1163,8 +1163,10 @@ mutual
         p2 := addCol cnt (addCol 3 st.pos)
      in case r2 of
           [] =>
-            Succ0 (YS p2 (emptyScalar st.evs)) []
-              @{trans w (uncons $ uncons $ uncons Same)}
+            -- an empty document at the very end of the input: docTail
+            -- still emits its DocEnd
+            let 0 p3 := trans w (uncons $ uncons $ uncons Same)
+             in trans (docTail (YS p2 (emptyScalar st.evs)) [] (r @{p3})) p3
           x :: xs =>
             if isBreak x || x == '#'
               then case skipToContent (x :: xs) of
