@@ -33,12 +33,12 @@ emptyScalar = (:< Scalar Nothing NoTag Plain "")
 ||| line folding), or a flow collection parsed into its own event
 ||| buffer.
 data Pending : Type where
-  PScalar : String -> Pending
+  PScalar : Style -> String -> Pending
   PFlow   : SnocList Event -> Pending
 
 flushPend : SnocList Event -> Pending -> SnocList Event
-flushPend evs (PScalar s) = evs :< Scalar Nothing NoTag Plain s
-flushPend evs (PFlow d)   = evs ++ d
+flushPend evs (PScalar sty s) = evs :< Scalar Nothing NoTag sty s
+flushPend evs (PFlow d)       = evs ++ d
 
 -- Is the next token a `:` value indicator in block context?
 colonBlock : List Char -> Bool
@@ -213,9 +213,17 @@ mutual
       then case flowNode inFlow mi (YS pos [<]) (c :: cs) sa of
         Fail0 e => Fail0 e
         Succ0 st1 r1 => Succ0 (PFlow st1.evs, st1.pos) r1
+      else if c == '\'' || c == '"'
+        then
+          let (tok, sty) := if c == '"'
+                              then (doubleQuoted mi, DoubleQ)
+                              else (singleQuoted mi, SingleQ)
+           in case tok (c :: cs) of
+                Succ s rem @{prf}     => Succ0 (PScalar sty s, endPos pos prf) rem
+                Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
       else if isPlainFirst inFlow c cs
         then case plainSegment inFlow (c :: cs) of
-          Succ s rem @{prf}     => Succ0 (PScalar s, move pos prf) rem
+          Succ s rem @{prf}     => Succ0 (PScalar Plain s, move pos prf) rem
           Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
         else parseFail (oneChar pos) (Unknown $ pack [c])
 
@@ -237,6 +245,14 @@ mutual
         let 0 pp := trans q1 (uncons Same)
             st1  := YS p1 (st.evs :< MapStart True Nothing NoTag)
          in succT (flowMap mi (oneChar st.pos) st1 r1 (r @{pp})) @{pp}
+    '\'' => case singleQuoted mi (c :: cs) of
+      Succ s rem @{prf} =>
+        Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag SingleQ s)) rem
+      Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
+    '"' => case doubleQuoted mi (c :: cs) of
+      Succ s rem @{prf} =>
+        Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag DoubleQ s)) rem
+      Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
     _   =>
       if isPlainFirst inFlow c cs
         then case plainSegment inFlow (c :: cs) of
@@ -283,13 +299,16 @@ mutual
               else case pend of
                 PFlow d   =>
                   succT (seqTail mi b (YS p2 (st.evs ++ d)) r2 (r @{pw})) @{pw}
-                PScalar s =>
+                PScalar Plain s =>
                   case plainMore True mi s p2 r2 (r @{pw}) of
                     Fail0 e => Fail0 e
                     Succ0 (s2, p3) r3 @{q3} =>
                       let 0 pp := trans q3 pw
                           st3  := YS p3 (st.evs :< Scalar Nothing NoTag Plain s2)
                        in succT (seqTail mi b st3 r3 (r @{pp})) @{pp}
+                PScalar sty s =>
+                  let st2 := YS p2 (st.evs :< Scalar Nothing NoTag sty s)
+                   in succT (seqTail mi b st2 r2 (r @{pw})) @{pw}
 
   ||| After a flow sequence entry: a comma and further entries, or the
   ||| closing bracket.
@@ -393,6 +412,12 @@ mutual
                   Succ0 st1 r1 @{q1} =>
                     let 0 p1 := trans q1 (uncons Same)
                      in trans (blockMap n st1 r1 (r @{p1})) p1
+        else if c == '|' || c == '>'
+          then case blockScalar (c == '>') mi (c :: cs) of
+            Succ s rem @{prf} =>
+              let sty := if c == '>' then Folded else Literal
+               in Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag sty s)) rem
+            Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
         else case cand False mi st.pos (c :: cs) sa of
           Fail0 e => Fail0 e
           Succ0 (pend, p1) r1 @{q1} =>
@@ -418,7 +443,7 @@ mutual
                       Fail0 e => Fail0 e
                       Succ0 p3 r3 @{q3} =>
                         Succ0 (YS p3 (st.evs ++ d)) r3 @{trans q3 pw}
-                    PScalar s => case plainMore False mi s p2 r2 (r @{pw}) of
+                    PScalar Plain s => case plainMore False mi s p2 r2 (r @{pw}) of
                       Fail0 e => Fail0 e
                       Succ0 (s2, p3) r3 @{q3} =>
                         if colonBlock r3
@@ -426,6 +451,11 @@ mutual
                           else
                             Succ0 (YS p3 (st.evs :< Scalar Nothing NoTag Plain s2)) r3
                               @{trans q3 pw}
+                    PScalar sty s => case lineEnd (cnt > 0) p2 r2 of
+                      Fail0 e => Fail0 e
+                      Succ0 p3 r3 @{q3} =>
+                        Succ0 (YS p3 (st.evs :< Scalar Nothing NoTag sty s)) r3
+                          @{trans q3 pw}
 
   ||| Entries of a block sequence anchored at column `n` [spec:
   ||| l+block-sequence], starting at a `- ` indicator. Emits the SeqEnd
@@ -612,16 +642,22 @@ mutual
                                  (weaken (uncons u))
 
   ||| A mapping value on the same line as its `:` indicator: a flow
-  ||| node [spec: s-l+flow-in-block].
+  ||| node or a block scalar [spec: s-l+flow-in-block, s-l+block-scalar].
   inlineVal : (n : Nat) -> Rule True YState
   inlineVal n st [] _ = eoi
   inlineVal n st (c :: cs) sa@(SA r) =
-    if c == '[' || c == '{'
+    if c == '[' || c == '{' || c == '\'' || c == '"'
       then case flowNode False (S n) st (c :: cs) sa of
         Fail0 e => Fail0 e
         Succ0 st1 r1 @{q1} => case lineEnd False st1.pos r1 of
           Fail0 e => Fail0 e
           Succ0 p2 r2 @{q2} => Succ0 (YS p2 st1.evs) r2 @{trans q2 q1}
+      else if c == '|' || c == '>'
+        then case blockScalar (c == '>') (S n) (c :: cs) of
+          Succ s rem @{prf} =>
+            let sty := if c == '>' then Folded else Literal
+             in Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag sty s)) rem
+          Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
       else if isPlainFirst False c cs
         then case plainSegment False (c :: cs) of
           Succ s rem @{prf} =>

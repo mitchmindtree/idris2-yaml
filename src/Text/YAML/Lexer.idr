@@ -181,6 +181,344 @@ inlineWhite cs = go 0 cs Same
     go n rem         p = IL n rem p
 
 --------------------------------------------------------------------------------
+--          Quoted Scalars
+--------------------------------------------------------------------------------
+
+||| Is the input at a `---` or `...` document marker? Only valid at
+||| column zero.
+public export
+isDocMarker : List Char -> Bool
+isDocMarker ('-' :: '-' :: '-' :: t) = wordEnd t
+isDocMarker ('.' :: '.' :: '.' :: t) = wordEnd t
+isDocMarker _                        = False
+
+-- appends k line feeds
+addNl : SnocList Char -> Nat -> SnocList Char
+addNl acc 0     = acc
+addNl acc (S k) = addNl (acc :< '\n') k
+
+-- the contribution of folding over k empty lines [spec: b-l-folded]
+foldNl : SnocList Char -> Nat -> SnocList Char
+foldNl acc 0 = acc :< ' '
+foldNl acc k = addNl acc k
+
+||| A single quoted scalar [spec: c-single-quoted], starting at its
+||| opening quote. A pair of quotes escapes a quote; line breaks fold;
+||| continuation lines must be indented at least `mi` spaces and must
+||| not be document markers.
+export
+singleQuoted : (mi : Nat) -> Tok True YErr String
+singleQuoted mi ('\'' :: cs) = go [<] [<] cs
+
+  where
+    mutual
+      -- content within a line; pend holds white space that is dropped
+      -- if the line ends
+      go : (acc, pend : SnocList Char) -> AutoTok YErr String
+      go acc pend ('\'' :: '\'' :: t) = go ((acc ++ pend) :< '\'') [<] t
+      go acc pend ('\'' :: t)         = Succ (cast (acc ++ pend)) t
+      go acc pend ('\n' :: t)         = lines acc 0 0 t
+      go acc pend (' '  :: t)         = go acc (pend :< ' ') t
+      go acc pend ('\t' :: t)         = go acc (pend :< '\t') t
+      go acc pend (c :: t)            =
+        if isControl c
+          then single (InvalidControl c) p
+          else go ((acc ++ pend) :< c) [<] t
+      go acc pend []                  = eoiAt p
+
+      -- at a line start: empty lines, then the next line's indentation
+      lines : (acc : SnocList Char) -> (k, ind : Nat) -> AutoTok YErr String
+      lines acc k ind ('\n' :: t) = lines acc (S k) 0 t
+      lines acc k ind (' '  :: t) = lines acc k (S ind) t
+      lines acc k ind ('\t' :: t) =
+        if ind >= mi then sep acc k t else single (Custom TabIndent) p
+      lines acc k ind []          = eoiAt p
+      lines acc k ind (c :: t)    =
+        if ind == 0 && isDocMarker (c :: t)
+          then single (Unknown "document marker") p
+        else if ind < mi
+          then single (Custom BadIndent) p
+        else go (foldNl acc k) [<] (c :: t)
+
+      -- white space separation beyond the indentation
+      sep : (acc : SnocList Char) -> (k : Nat) -> AutoTok YErr String
+      sep acc k (' '  :: t) = sep acc k t
+      sep acc k ('\t' :: t) = sep acc k t
+      sep acc k ('\n' :: t) = lines acc (S k) 0 t
+      sep acc k []          = eoiAt p
+      sep acc k (c :: t)    = go (foldNl acc k) [<] (c :: t)
+
+singleQuoted _ cs = fail Same
+
+||| A double quoted scalar [spec: c-double-quoted], starting at its
+||| opening quote: backslash escape sequences (including escaped line
+||| breaks), line folding, and the same indentation and document marker
+||| rules as single quoted scalars.
+export
+doubleQuoted : (mi : Nat) -> Tok True YErr String
+doubleQuoted mi ('"' :: cs) = go [<] [<] cs
+
+  where
+    escChar : Char -> Maybe Char
+    escChar '0'  = Just '\0'
+    escChar 'a'  = Just '\x07'
+    escChar 'b'  = Just '\b'
+    escChar 't'  = Just '\t'
+    escChar 'n'  = Just '\n'
+    escChar 'v'  = Just '\x0b'
+    escChar 'f'  = Just '\x0c'
+    escChar 'r'  = Just '\r'
+    escChar 'e'  = Just '\x1b'
+    escChar ' '  = Just ' '
+    escChar '"'  = Just '"'
+    escChar '/'  = Just '/'
+    escChar '\\' = Just '\\'
+    escChar 'N'  = Just '\x85'
+    escChar '_'  = Just '\xa0'
+    escChar 'L'  = Just '\x2028'
+    escChar 'P'  = Just '\x2029'
+    escChar _    = Nothing
+
+    toChar : Nat -> Maybe Char
+    toChar n =
+      if n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)
+        then Nothing
+        else Just (chr $ cast n)
+
+    mutual
+      go : (acc, pend : SnocList Char) -> AutoTok YErr String
+      go acc pend ('"'  :: t)      = Succ (cast (acc ++ pend)) t
+      go acc pend ('\\' :: c :: t) = case c of
+        -- an escaped break: white space before it is kept, lines do
+        -- not fold [spec: s-double-escaped]
+        '\n' => lines (acc ++ pend) True 0 0 t
+        'x'  => hex (acc ++ pend) 2 0 t
+        'u'  => hex (acc ++ pend) 4 0 t
+        'U'  => hex (acc ++ pend) 8 0 t
+        _    => case escChar c of
+          Just ch => go ((acc ++ pend) :< ch) [<] t
+          Nothing => invalidEscape p t
+      go acc pend ('\\' :: [])     = invalidEscape p []
+      go acc pend ('\n' :: t)      = lines acc False 0 0 t
+      go acc pend (' '  :: t)      = go acc (pend :< ' ') t
+      go acc pend ('\t' :: t)      = go acc (pend :< '\t') t
+      go acc pend (c :: t)         =
+        if isControl c
+          then single (InvalidControl c) p
+          else go ((acc ++ pend) :< c) [<] t
+      go acc pend []               = eoiAt p
+
+      -- a fixed number of hex digits of a character escape
+      hex : (acc : SnocList Char) -> (k, val : Nat) -> AutoTok YErr String
+      hex acc 0     val cs2 = case toChar val of
+        Just ch => go (acc :< ch) [<] cs2
+        Nothing => invalidEscape p cs2
+      hex acc (S k) val (c :: t) =
+        if isHexDigit c
+          then hex acc k (val * 16 + hexDigit c) t
+          else invalidEscape p t
+      hex acc (S k) val [] = eoiAt p
+
+      -- at a line start; `eb` is true after an escaped break, which
+      -- suppresses the folding space
+      lines : (acc : SnocList Char) -> (eb : Bool) -> (k, ind : Nat) -> AutoTok YErr String
+      lines acc eb k ind ('\n' :: t) = lines acc eb (S k) 0 t
+      lines acc eb k ind (' '  :: t) = lines acc eb k (S ind) t
+      lines acc eb k ind ('\t' :: t) =
+        if ind >= mi then sep acc eb k t else single (Custom TabIndent) p
+      lines acc eb k ind []          = eoiAt p
+      lines acc eb k ind (c :: t)    =
+        if ind == 0 && isDocMarker (c :: t)
+          then single (Unknown "document marker") p
+        else if ind < mi
+          then single (Custom BadIndent) p
+        else go (if eb then addNl acc k else foldNl acc k) [<] (c :: t)
+
+      -- white space separation beyond the indentation
+      sep : (acc : SnocList Char) -> (eb : Bool) -> (k : Nat) -> AutoTok YErr String
+      sep acc eb k (' '  :: t) = sep acc eb k t
+      sep acc eb k ('\t' :: t) = sep acc eb k t
+      sep acc eb k ('\n' :: t) = lines acc eb (S k) 0 t
+      sep acc eb k []          = eoiAt p
+      sep acc eb k (c :: t)    = go (if eb then addNl acc k else foldNl acc k) [<] (c :: t)
+
+doubleQuoted _ cs = fail Same
+
+--------------------------------------------------------------------------------
+--          Block Scalars
+--------------------------------------------------------------------------------
+
+||| Chomping of a block scalar's trailing line breaks
+||| [spec: c-chomping-indicator].
+public export
+data Chomp = Strip | Clip | Keep
+
+||| A block scalar [spec: c-l+literal, c-l+folded], starting at its `|`
+||| or `>` indicator: the header (indentation and chomping indicators
+||| plus an optional comment), then the indented content lines.
+|||
+||| `mi` is the minimum content indentation, that is, the parent
+||| node's indentation plus one; an explicit indentation indicator `d`
+||| anchors the content at `mi + d - 1` columns.
+export
+blockScalar : (folded : Bool) -> (mi : Nat) -> Tok True YErr String
+blockScalar folded mi (c :: cs) = hdr Nothing Nothing cs
+
+  where
+    -- assembles the final scalar from the accumulated content and the
+    -- pending trailing line breaks
+    fin : Chomp -> (acc : SnocList Char) -> (brk : Nat) -> String
+    fin Strip acc _   = cast acc
+    fin Keep  acc brk = cast (addNl acc brk)
+    fin Clip  acc brk = case acc of
+      [<] => ""
+      _   => if brk > 0 then cast (acc :< '\n') else cast acc
+
+    -- the contribution of a content line: pending breaks (folded where
+    -- applicable), then the line itself [spec: b-l-folded]
+    contrib :
+         (prev : Maybe Bool)   -- spacedness of the previous line, if any
+      -> (brk : Nat)           -- pending line breaks
+      -> (spaced : Bool)       -- does this line start with white space?
+      -> (acc, line : SnocList Char)
+      -> SnocList Char
+    contrib prev brk spaced acc line =
+      let joined := case prev of
+            Nothing => addNl acc brk
+            Just pSp =>
+              if folded && not pSp && not spaced
+                then (if brk == 1 then acc :< ' ' else addNl acc (brk `minus` 1))
+                else addNl acc brk
+       in joined ++ line
+
+    -- the content indentation: fixed (explicit or detected), or still
+    -- to be detected (tracking the deepest empty line seen so far)
+    data Ci = Fixed Nat | Auto Nat
+
+    -- classification of the next line, without consuming it
+    data PLine = PBlank Nat | PEnd | PCont Nat Bool
+
+    peek : Nat -> List Char -> PLine
+    peek n (' '  :: t) = peek (S n) t
+    peek n ('\n' :: _) = PBlank n
+    peek n []          = PEnd
+    peek n cs2         = PCont n (n == 0 && isDocMarker cs2)
+
+    startCi : Maybe Nat -> Ci
+    startCi Nothing  = Auto 0
+    startCi (Just d) = Fixed ((mi + d) `minus` 1)
+
+    mutual
+      -- at a line start: decide whether the next line still belongs to
+      -- the scalar before consuming anything
+      atLine :
+           Chomp -> Ci -> (prev : Maybe Bool) -> (acc : SnocList Char)
+        -> (brk : Nat) -> AutoTok YErr String
+      atLine ch ci prev acc brk cs2 = case peek 0 cs2 of
+        PEnd     => Succ (fin ch acc brk) cs2
+        PBlank n => case ci of
+          Auto mb => blank ch (Auto $ max mb n) prev acc brk cs2
+          Fixed n2 =>
+            if n > n2
+              then capture ch n2 prev acc brk 0 [<] cs2
+              else blank ch (Fixed n2) prev acc brk cs2
+        PCont n marker => case ci of
+          Auto mb =>
+            if n < mi || marker
+              then Succ (fin ch acc brk) cs2
+            else if mb > n
+              then fail Same
+            else capture ch n prev acc brk 0 [<] cs2
+          Fixed n2 =>
+            if n < n2
+              then Succ (fin ch acc brk) cs2
+              else capture ch n2 prev acc brk 0 [<] cs2
+
+      -- consumes an empty line
+      blank :
+           Chomp -> Ci -> (prev : Maybe Bool) -> (acc : SnocList Char)
+        -> (brk : Nat) -> AutoTok YErr String
+      blank ch ci prev acc brk (' '  :: t) = blank ch ci prev acc brk t
+      blank ch ci prev acc brk ('\n' :: t) = atLine ch ci prev acc (S brk) t
+      blank ch ci prev acc brk (_ :: t)    = fail Same
+      blank ch ci prev acc brk []          = Succ (fin ch acc brk) []
+
+      -- consumes a content line: its indentation (spaces beyond the
+      -- content indent are content), then the raw text
+      capture :
+           Chomp -> (n : Nat) -> (prev : Maybe Bool) -> (acc : SnocList Char)
+        -> (brk, m : Nat) -> (line : SnocList Char) -> AutoTok YErr String
+      capture ch n prev acc brk m line (' ' :: t) =
+        if m >= n
+          then capture ch n prev acc brk (S m) (line :< ' ') t
+          else capture ch n prev acc brk (S m) line t
+      capture ch n prev acc brk m line ('\t' :: t) =
+        if m >= n
+          then capLine ch n prev acc brk True (line :< '\t') t
+          else single (Custom TabIndent) p
+      capture ch n prev acc brk m line ('\n' :: t) =
+        let spaced := m > n
+         in atLine ch (Fixed n) (Just spaced) (contrib prev brk spaced acc line) 1 t
+      capture ch n prev acc brk m line [] =
+        let spaced := m > n
+         in Succ (fin ch (contrib prev brk spaced acc line) 0) []
+      capture ch n prev acc brk m line (x :: t) =
+        if isControl x
+          then single (InvalidControl x) p
+          else capLine ch n prev acc brk (m > n) (line :< x) t
+
+      -- the raw remainder of a content line
+      capLine :
+           Chomp -> (n : Nat) -> (prev : Maybe Bool) -> (acc : SnocList Char)
+        -> (brk : Nat) -> (spaced : Bool) -> (line : SnocList Char)
+        -> AutoTok YErr String
+      capLine ch n prev acc brk spaced line ('\n' :: t) =
+        atLine ch (Fixed n) (Just spaced) (contrib prev brk spaced acc line) 1 t
+      capLine ch n prev acc brk spaced line (x :: t) =
+        if isControl x && x /= '\t'
+          then single (InvalidControl x) p
+          else capLine ch n prev acc brk spaced (line :< x) t
+      capLine ch n prev acc brk spaced line [] =
+        Succ (fin ch (contrib prev brk spaced acc line) 0) []
+
+      -- the header: at most one indentation digit and one chomping
+      -- indicator, optional comment, then the first line break
+      hdr : (d : Maybe Nat) -> (ch : Maybe Chomp) -> AutoTok YErr String
+      hdr d ch ('-' :: t)  = case ch of
+        Nothing => hdr d (Just Strip) t
+        Just _  => fail Same
+      hdr d ch ('+' :: t)  = case ch of
+        Nothing => hdr d (Just Keep) t
+        Just _  => fail Same
+      hdr d ch ('\n' :: t) = atLine (maybe Clip id ch) (startCi d) Nothing [<] 0 t
+      hdr d ch (' '  :: t) = hdrEnd d ch t
+      hdr d ch ('\t' :: t) = hdrEnd d ch t
+      hdr d ch []          = Succ (fin (maybe Clip id ch) [<] 0) []
+      hdr d ch (x :: t)    =
+        if isDigit x && x /= '0'
+          then case d of
+            Nothing => hdr (Just $ digit x) ch t
+            Just _  => fail Same
+          else fail Same
+
+      -- after the header's indicators: separation and a comment
+      hdrEnd : (d : Maybe Nat) -> (ch : Maybe Chomp) -> AutoTok YErr String
+      hdrEnd d ch (' '  :: t) = hdrEnd d ch t
+      hdrEnd d ch ('\t' :: t) = hdrEnd d ch t
+      hdrEnd d ch ('#'  :: t) = hdrCom d ch t
+      hdrEnd d ch ('\n' :: t) = atLine (maybe Clip id ch) (startCi d) Nothing [<] 0 t
+      hdrEnd d ch []          = Succ (fin (maybe Clip id ch) [<] 0) []
+      hdrEnd d ch (x :: t)    = fail Same
+
+      -- the header's comment
+      hdrCom : (d : Maybe Nat) -> (ch : Maybe Chomp) -> AutoTok YErr String
+      hdrCom d ch ('\n' :: t) = atLine (maybe Clip id ch) (startCi d) Nothing [<] 0 t
+      hdrCom d ch (_ :: t)    = hdrCom d ch t
+      hdrCom d ch []          = Succ (fin (maybe Clip id ch) [<] 0) []
+
+blockScalar _ _ [] = eoiAt Same
+
+--------------------------------------------------------------------------------
 --          Plain Scalars
 --------------------------------------------------------------------------------
 
