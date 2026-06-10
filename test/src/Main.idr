@@ -391,20 +391,33 @@ failure _        = Nothing
 
 prop_cyclicAlias : Property
 prop_cyclicAlias = withTests 1 $ property $
-  map fst (failure $ parseDocs Virtual "&a [*a]") ===
-    Just (Custom (CyclicAlias "a"))
+  failure (parseDocs Virtual "&a [*a]") ===
+    Just (Custom (CyclicAlias "a"), BS (P 0 4) (P 0 6))   -- the `*a`
 
 prop_undefinedAlias : Property
 prop_undefinedAlias = withTests 1 $ property $
-  map fst (failure $ parseDocs Virtual "[*nope]") ===
-    Just (Custom (UndefinedAlias "nope"))
+  failure (parseDocs Virtual "[*nope]") ===
+    Just (Custom (UndefinedAlias "nope"), BS (P 0 1) (P 0 6))
 
 -- the plain key `a` and the quoted key "a" are equal: styles do not
 -- distinguish keys
 prop_dupKeyAcrossStyles : Property
 prop_dupKeyAcrossStyles = withTests 1 $ property $
-  map fst (failure $ parseDocs Virtual "{a: 1, \"a\": 2}") ===
-    Just (Custom (DuplicateKey "\"a\""))
+  failure (parseDocs Virtual "{a: 1, \"a\": 2}") ===
+    Just (Custom (DuplicateKey "\"a\""), BS (P 0 7) (P 0 10))   -- the second key
+
+-- duplicate collection keys span the whole key, across lines
+prop_dupKeySpansCollection : Property
+prop_dupKeySpansCollection = withTests 1 $ property $
+  failure (parseDocs Virtual "? [a,\n   b]\n: 1\n? [a,\n   b]\n: 2") ===
+    Just (Custom (DuplicateKey #"["a", "b"]"#), BS (P 3 2) (P 4 5))
+
+-- rendered composer errors include the source excerpt with a caret
+prop_errorRenderingHasCaret : Property
+prop_errorRenderingHasCaret = withTests 1 $ property $
+  case parseDocs Virtual "[*nope]" of
+    Left e  => assert (any (elem '^' . unpack) (lines "\{e}"))
+    Right _ => assert False
 
 prop_anchorShadowing : Property
 prop_anchorShadowing = withTests 1 $ property $
@@ -427,6 +440,8 @@ composeProps =
     , ("prop_cyclicAlias", prop_cyclicAlias)
     , ("prop_undefinedAlias", prop_undefinedAlias)
     , ("prop_dupKeyAcrossStyles", prop_dupKeyAcrossStyles)
+    , ("prop_dupKeySpansCollection", prop_dupKeySpansCollection)
+    , ("prop_errorRenderingHasCaret", prop_errorRenderingHasCaret)
     , ("prop_anchorShadowing", prop_anchorShadowing)
     , ("prop_emptyDocIsNull", prop_emptyDocIsNull)
     ]
