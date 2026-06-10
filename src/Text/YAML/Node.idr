@@ -69,32 +69,6 @@ data Node : Type where
   NSeq    : (tag : STag) -> List Node -> Node
   NMap    : (tag : STag) -> List (Node, Node) -> Node
 
-mutual
-  eqNode : Node -> Node -> Bool
-  eqNode (NScalar t1 _ s1) (NScalar t2 _ s2) = t1 == t2 && s1 == s2
-  eqNode (NSeq t1 ns1)     (NSeq t2 ns2)     = t1 == t2 && eqNodes ns1 ns2
-  eqNode (NMap t1 ps1)     (NMap t2 ps2)     = t1 == t2 && eqPairs ps1 ps2
-  eqNode _                 _                 = False
-
-  eqNodes : List Node -> List Node -> Bool
-  eqNodes []        []        = True
-  eqNodes (x :: xs) (y :: ys) = eqNode x y && eqNodes xs ys
-  eqNodes _         _         = False
-
-  eqPairs : List (Node, Node) -> List (Node, Node) -> Bool
-  eqPairs []              []              = True
-  eqPairs ((k1,v1) :: xs) ((k2,v2) :: ys) =
-    eqNode k1 k2 && eqNode v1 v2 && eqPairs xs ys
-  eqPairs _               _               = False
-
-||| Node equality is tag and content [spec 3.2.1.3]: the presentation
-||| style does not participate, so the plain key `a` and the quoted key
-||| `"a"` are equal. Scalar content is compared as raw text, not as a
-||| canonical value: the integers `1` and `0x1` are distinct.
-export %inline
-Eq Node where
-  (==) = eqNode
-
 scText : SnocList String -> String -> SnocList String
 scText ss s = ss :< show s
 
@@ -292,10 +266,33 @@ asInteger : Node -> Maybe Integer
 asInteger (NScalar TInt _ s) = intVal (unpack s)
 asInteger _                  = Nothing
 
--- Decomposes a core schema float into sign, integer digits, fraction
--- digits and exponent, and rebuilds it in a canonical form every
--- backend's `cast String Double` handles (`.5`, `5.` and `1.e3` are
--- valid YAML but not portable strtod input).
+-- Decomposes a core schema float (sign already stripped) into its
+-- integer digits, fraction digits and exponent value: at least one
+-- mantissa digit, an optional fraction and an optional exponent.
+floatParts : List Char -> Maybe (List Char, List Char, Integer)
+floatParts cs =
+  let (ip, r1) := span isDigit cs
+      (fp, r2) := case r1 of
+                    '.' :: t => span isDigit t
+                    _        => ([], r1)
+   in case (ip, fp) of
+        ([], []) => Nothing
+        _        => (\e => (ip, fp, e)) <$> expVal r2
+
+  where
+    expVal : List Char -> Maybe Integer
+    expVal []       = Just 0
+    expVal (e :: r) =
+      if e == 'e' || e == 'E'
+        then case r of
+          '+' :: ds => digits 10 decDigit ds
+          '-' :: ds => negate <$> digits 10 decDigit ds
+          ds        => digits 10 decDigit ds
+        else Nothing
+
+-- Rebuilds a float in a form every backend's `cast String Double`
+-- handles (`.5`, `5.` and `1.e3` are valid YAML but not portable
+-- strtod input).
 dblVal : String -> Maybe Double
 dblVal s =
   if s `elem` posInfWords
@@ -314,27 +311,10 @@ dblVal s =
     orZero [] = "0"
     orZero cs = pack cs
 
-    -- the exponent's digits (with sign), or "0" when absent
-    expVal : List Char -> Maybe String
-    expVal []       = Just "0"
-    expVal (e :: r) =
-      if e == 'e' || e == 'E'
-        then case r of
-          '+' :: ds => if all1 isDigit ds then Just (pack ds) else Nothing
-          '-' :: ds => if all1 isDigit ds then Just ("-" ++ pack ds) else Nothing
-          ds        => if all1 isDigit ds then Just (pack ds) else Nothing
-        else Nothing
-
     build : String -> List Char -> Maybe Double
     build sign cs =
-      let (ip, r1) := span isDigit cs
-          (fp, r2) := case r1 of
-                        '.' :: t => span isDigit t
-                        _        => ([], r1)
-       in case (ip, fp) of
-            ([], []) => Nothing
-            _        =>
-              (\e => cast "\{sign}\{orZero ip}.\{orZero fp}e\{e}") <$> expVal r2
+      (\(ip, fp, e) => cast "\{sign}\{orZero ip}.\{orZero fp}e\{show e}")
+        <$> floatParts cs
 
 ||| The numeric value of a float- or int-tagged scalar node.
 public export
@@ -364,3 +344,100 @@ lookupKey s (NMap _ ps) = go ps
     go ((NScalar _ _ t, v) :: rest) = if t == s then Just v else go rest
     go (_ :: rest)                  = go rest
 lookupKey _ _ = Nothing
+
+--------------------------------------------------------------------------------
+--          Node Equality
+--------------------------------------------------------------------------------
+
+-- The canonical value of a core schema scalar [spec 10.3.2]. Floats
+-- are kept in exact decimal scientific notation rather than as
+-- `Double`: IEEE comparison would break reflexivity (NaN /= NaN) and
+-- collapse out-of-range values (1e400 == 2e400 == +inf).
+data CScalar : Type where
+  CNull : CScalar
+  CBool : Bool -> CScalar
+  CInt  : Integer -> CScalar
+  CZero : CScalar
+  CInf  : (neg : Bool) -> CScalar
+  CNaN  : CScalar
+  -- value = (-1)^neg * d1.d2...dn * 10^exp, where `digits` are
+  -- d1...dn with d1 and dn nonzero [spec: canonical float form]
+  CSci  : (neg : Bool) -> (digits : String) -> (exp : Integer) -> CScalar
+
+Eq CScalar where
+  CNull       == CNull       = True
+  CBool x     == CBool y     = x == y
+  CInt x      == CInt y      = x == y
+  CZero       == CZero       = True
+  CInf x      == CInf y      = x == y
+  CNaN        == CNaN        = True
+  CSci n d e  == CSci m f g  = n == m && d == f && e == g
+  _           == _           = False
+
+canonFloat : String -> Maybe CScalar
+canonFloat s =
+  if s `elem` posInfWords then Just (CInf False)
+  else if s `elem` negInfWords then Just (CInf True)
+  else if s `elem` nanWords then Just CNaN
+  else case unpack s of
+    '+' :: cs => norm False cs
+    '-' :: cs => norm True cs
+    cs        => norm False cs
+
+  where
+    norm : Bool -> List Char -> Maybe CScalar
+    norm neg cs = do
+      (ip, fp, e) <- floatParts cs
+      let (zs, ds) := span ('0' ==) (ip ++ fp)
+      case reverse (dropWhile ('0' ==) (reverse ds)) of
+        [] => Just CZero
+        ds' =>
+          Just (CSci neg (pack ds') (e + cast (length ip) - cast (length zs) - 1))
+
+-- The canonical value of a scalar, when its tag defines one for the
+-- given content; `Nothing` requests raw text comparison.
+canonScalar : STag -> String -> Maybe CScalar
+canonScalar TNull  s = if s `elem` nullWords then Just CNull else Nothing
+canonScalar TBool  s =
+  if s `elem` trueWords then Just (CBool True)
+  else if s `elem` falseWords then Just (CBool False)
+  else Nothing
+canonScalar TInt   s = CInt <$> intVal (unpack s)
+canonScalar TFloat s = canonFloat s
+canonScalar _      _ = Nothing
+
+-- Two canonicalizable contents compare by value; everything else by
+-- raw text. The mixed case can only fall through to inequality:
+-- `canonScalar t` is a function, so equal raw text canonicalizes
+-- identically. This keeps `==` an equivalence relation.
+eqScalar : STag -> String -> String -> Bool
+eqScalar t a b = case (canonScalar t a, canonScalar t b) of
+  (Just x, Just y) => x == y
+  _                => a == b
+
+mutual
+  eqNode : Node -> Node -> Bool
+  eqNode (NScalar t1 _ s1) (NScalar t2 _ s2) = t1 == t2 && eqScalar t1 s1 s2
+  eqNode (NSeq t1 ns1)     (NSeq t2 ns2)     = t1 == t2 && eqNodes ns1 ns2
+  eqNode (NMap t1 ps1)     (NMap t2 ps2)     = t1 == t2 && eqPairs ps1 ps2
+  eqNode _                 _                 = False
+
+  eqNodes : List Node -> List Node -> Bool
+  eqNodes []        []        = True
+  eqNodes (x :: xs) (y :: ys) = eqNode x y && eqNodes xs ys
+  eqNodes _         _         = False
+
+  eqPairs : List (Node, Node) -> List (Node, Node) -> Bool
+  eqPairs []              []              = True
+  eqPairs ((k1,v1) :: xs) ((k2,v2) :: ys) =
+    eqNode k1 k2 && eqNode v1 v2 && eqPairs xs ys
+  eqPairs _               _               = False
+
+||| Node equality is tag and content [spec 3.2.1.3]: the presentation
+||| style does not participate, so the plain key `a` and the quoted key
+||| `"a"` are equal. Scalar content is compared by canonical value
+||| where the tag defines one (`1`, `0x1` and `+1` are the same int,
+||| `10.0` and `1e1` the same float), and as raw text otherwise.
+export %inline
+Eq Node where
+  (==) = eqNode

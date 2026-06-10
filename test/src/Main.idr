@@ -412,6 +412,45 @@ prop_dupKeySpansCollection = withTests 1 $ property $
   failure (parseDocs Virtual "? [a,\n   b]\n: 1\n? [a,\n   b]\n: 2") ===
     Just (Custom (DuplicateKey #"["a", "b"]"#), BS (P 3 2) (P 4 5))
 
+-- the node of a single-document source
+doc1 : String -> Maybe Node
+doc1 s = case parseDocs Virtual s of
+  Right [n] => Just n
+  _         => Nothing
+
+-- whether two single-document sources compose to equal nodes
+sameNode : String -> String -> Maybe Bool
+sameNode a b = [| doc1 a == doc1 b |]
+
+-- scalars with a canonical form compare by value
+prop_canonEqual : Property
+prop_canonEqual = withTests 1 $ property $ do
+  sameNode "0x10" "16"             === Just True
+  sameNode "0o10" "8"              === Just True
+  sameNode "+1" "1"                === Just True
+  sameNode "true" "True"           === Just True
+  sameNode "~" "null"              === Just True
+  sameNode "---" "null"            === Just True   -- empty document
+  sameNode ".nan" ".NaN"           === Just True
+  sameNode "0.0" "-0e7"            === Just True
+  sameNode "1e2" "100.0"           === Just True
+  sameNode "!!int abc" "!!int abc" === Just True   -- raw text fallback
+
+-- ... but tags must agree, and unresolvable content compares raw
+prop_canonUnequal : Property
+prop_canonUnequal = withTests 1 $ property $ do
+  sameNode "1" "1.0"             === Just False   -- int vs float
+  sameNode "100" "1e2"           === Just False   -- int vs float
+  sameNode "'1'" "1"             === Just False   -- str vs int
+  sameNode "!!int 1" "!!int abc" === Just False
+  sameNode "1e400" "2e400"       === Just False   -- no overflow collapse
+
+-- canonically equal keys are duplicates
+prop_dupKeyCanonical : Property
+prop_dupKeyCanonical = withTests 1 $ property $
+  failure (parseDocs Virtual "{1: a, 0x1: b}") ===
+    Just (Custom (DuplicateKey "\"0x1\""), BS (P 0 7) (P 0 10))
+
 -- rendered composer errors include the source excerpt with a caret
 prop_errorRenderingHasCaret : Property
 prop_errorRenderingHasCaret = withTests 1 $ property $
@@ -441,6 +480,9 @@ composeProps =
     , ("prop_undefinedAlias", prop_undefinedAlias)
     , ("prop_dupKeyAcrossStyles", prop_dupKeyAcrossStyles)
     , ("prop_dupKeySpansCollection", prop_dupKeySpansCollection)
+    , ("prop_canonEqual", prop_canonEqual)
+    , ("prop_canonUnequal", prop_canonUnequal)
+    , ("prop_dupKeyCanonical", prop_dupKeyCanonical)
     , ("prop_errorRenderingHasCaret", prop_errorRenderingHasCaret)
     , ("prop_anchorShadowing", prop_anchorShadowing)
     , ("prop_emptyDocIsNull", prop_emptyDocIsNull)
