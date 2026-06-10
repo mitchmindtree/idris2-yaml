@@ -39,6 +39,12 @@ are interpreted on demand by typed views (`asBool`, `asInteger`,
 `asDouble`, `asString`, ...), so an explicitly tagged `!!int abc`
 composes fine and only fails on access.
 
+Node equality - and so duplicate key detection - follows the spec:
+equal tags and equal canonical content. Scalars whose tag defines a
+canonical form compare by value, so `1`, `0x1` and `+1` are the same
+key (while `1` and `1.0` are not: their tags differ); scalars without
+one (unknown tags, unresolvable content) compare by raw text.
+
 Errors - from the parser and the composer alike - carry source spans
 and render as an excerpt of the offending input:
 
@@ -49,10 +55,6 @@ virtual: 1:5--1:7
  1 | &a [*a]
          ^^
 ```
-
-One deliberate deviation worth knowing about: node equality (used for
-duplicate key detection) compares scalars by tag and raw text, so the
-keys `1` and `0x1` are distinct.
 
 The event level is also part of the public API:
 
