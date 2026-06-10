@@ -1,6 +1,7 @@
 package yaml
 version   = 0.1.0
 authors   = "mitchmindtree"
+license   = "BSD-2-Clause"
 sourcedir = "src"
 depends   = parser
 
