@@ -119,17 +119,34 @@ covering
 isFile : String -> IO Bool
 isFile = map isRight . readFile
 
-||| `pack test` may invoke the runner from different working directories,
-||| so we probe the known locations of the suite data.
+||| `pack test` may invoke the runner from arbitrary working
+||| directories, so besides an environment override and locations
+||| relative to the working directory, we derive candidates from the
+||| executable's own path (`<pkg>/test/build/exec/yaml-test`, possibly
+||| one level deeper in the backend's `_app` directory).
 covering
 findPaths : IO (Maybe Paths)
 findPaths = do
-  env <- getEnv "YAML_TEST_SUITE_DIR"
-  go (maybe bases (:: bases) env)
+  env  <- getEnv "YAML_TEST_SUITE_DIR"
+  args <- getArgs
+  let exeBases := case args of
+        a0 :: _ => mapMaybe (fromExe a0) [3, 4]
+        []      => []
+  go (maybe id (::) env (bases ++ exeBases))
 
   where
     bases : List String
     bases = map (++ "suite") ["", "test/"]
+
+    -- strips the last `k` path components (build/exec/name[/so]) off
+    -- the executable's path, yielding the test directory
+    fromExe : String -> Nat -> Maybe String
+    fromExe a0 k =
+      let parts := forget $ split (== '/') a0
+       in case length parts > k of
+            False => Nothing
+            True  =>
+              Just $ joinBy "/" (take (length parts `minus` k) parts) ++ "/suite"
 
     go : List String -> IO (Maybe Paths)
     go []        = pure Nothing
