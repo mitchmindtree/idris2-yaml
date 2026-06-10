@@ -56,6 +56,8 @@ data YAMLErr : Type where
   YParse   : ParseError YErr -> YAMLErr
   YCompose : ComposeErr -> YAMLErr
 
+%runElab derive "YAMLErr" [Show,Eq]
+
 export
 Interpolation YAMLErr where
   interpolate (YParse e)   = interpolate e
