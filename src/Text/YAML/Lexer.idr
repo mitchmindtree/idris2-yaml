@@ -103,6 +103,9 @@ record Look where
   ||| for `LContent`.
   indent : Nat
   kind   : LineKind
+  ||| Did tabs occur between the indentation and the content? Block
+  ||| structure must not be preceded by tabs [spec 6.1].
+  tabbed : Bool
 
 ||| Result of `skipToContent`: the classification of what follows, the
 ||| remaining input, and a proof relating it to the original input.
@@ -131,34 +134,34 @@ skipToContent cs = line cs Same
       line : (rem : List Char) -> Suffix False rem cs -> SkipRes cs
       line ('-' :: '-' :: '-' :: t) p =
         if wordEnd t
-          then SR (L 0 LDocStart) ('-' :: '-' :: '-' :: t) p
+          then SR (L 0 LDocStart False) ('-' :: '-' :: '-' :: t) p
           else indent 0 ('-' :: '-' :: '-' :: t) p
       line ('.' :: '.' :: '.' :: t) p =
         if wordEnd t
-          then SR (L 0 LDocEnd) ('.' :: '.' :: '.' :: t) p
+          then SR (L 0 LDocEnd False) ('.' :: '.' :: '.' :: t) p
           else indent 0 ('.' :: '.' :: '.' :: t) p
       line rem p = indent 0 rem p
 
       -- counting indentation spaces
       indent : Nat -> (rem : List Char) -> Suffix False rem cs -> SkipRes cs
       indent n (' ' :: t) p = indent (S n) t (Uncons p)
-      indent n rem        p = white n rem p
+      indent n rem        p = white n False rem p
 
       -- white space beyond the indentation (tabs are separation,
       -- not indentation)
-      white : Nat -> (rem : List Char) -> Suffix False rem cs -> SkipRes cs
-      white n ('\t' :: t) p = white n t (Uncons p)
-      white n (' '  :: t) p = white n t (Uncons p)
-      white n ('\n' :: t) p = line t (Uncons p)
-      white n ('#'  :: t) p = comment t (Uncons p)
-      white n []          p = SR (L 0 LEnd) [] p
-      white n rem         p = SR (L n LContent) rem p
+      white : Nat -> (tb : Bool) -> (rem : List Char) -> Suffix False rem cs -> SkipRes cs
+      white n tb ('\t' :: t) p = white n True t (Uncons p)
+      white n tb (' '  :: t) p = white n tb t (Uncons p)
+      white n tb ('\n' :: t) p = line t (Uncons p)
+      white n tb ('#'  :: t) p = comment t (Uncons p)
+      white n tb []          p = SR (L 0 LEnd False) [] p
+      white n tb rem         p = SR (L n LContent tb) rem p
 
       -- the rest of a comment line
       comment : (rem : List Char) -> Suffix False rem cs -> SkipRes cs
       comment ('\n' :: t) p = line t (Uncons p)
       comment (_    :: t) p = comment t (Uncons p)
-      comment []          p = SR (L 0 LEnd) [] p
+      comment []          p = SR (L 0 LEnd False) [] p
 
 ||| Result of `inlineWhite`: a count of skipped white space characters,
 ||| the remaining input, and a proof relating it to the original input.
@@ -166,19 +169,21 @@ public export
 record Inl (cs : List Char) where
   constructor IL
   count : Nat
+  ||| Was any of the white space a tab?
+  tab   : Bool
   rem   : List Char
   prf   : Suffix False rem cs
 
 ||| Consumes white space within a line.
 export
 inlineWhite : (cs : List Char) -> Inl cs
-inlineWhite cs = go 0 cs Same
+inlineWhite cs = go 0 False cs Same
 
   where
-    go : Nat -> (rem : List Char) -> Suffix False rem cs -> Inl cs
-    go n (' '  :: t) p = go (S n) t (Uncons p)
-    go n ('\t' :: t) p = go (S n) t (Uncons p)
-    go n rem         p = IL n rem p
+    go : Nat -> Bool -> (rem : List Char) -> Suffix False rem cs -> Inl cs
+    go n tb (' '  :: t) p = go (S n) tb t (Uncons p)
+    go n tb ('\t' :: t) p = go (S n) True t (Uncons p)
+    go n tb rem         p = IL n tb rem p
 
 --------------------------------------------------------------------------------
 --          Anchors and Tags
@@ -256,6 +261,10 @@ tagToken ('!' :: '<' :: cs) = verb [<] cs
     verb acc ('>' :: t) = case acc of
       [<] => fail p
       _   => Succ (Left (Verbatim (cast acc))) t
+    verb acc ('%' :: x :: y :: t) =
+      if isHexDigit x && isHexDigit y
+        then verb (acc :< chr (cast $ hexDigit x * 16 + hexDigit y)) t
+        else invalidEscape p t
     verb acc (x :: t)   =
       if isUriChar x then verb (acc :< x) t else fail p
     verb acc []         = eoiAt p
@@ -265,8 +274,12 @@ tagToken ('!' :: cs) = sh [<] True cs
   where
     -- the suffix after a named or secondary handle
     suff : String -> SnocList Char -> AutoTok YErr (Either Tag (String, String))
+    suff h acc ('%' :: x :: y :: t) =
+      if isHexDigit x && isHexDigit y
+        then suff h (acc :< chr (cast $ hexDigit x * 16 + hexDigit y)) t
+        else invalidEscape p t
     suff h acc (x :: t) =
-      if isTagChar x
+      if isTagChar x && x /= '%'
         then suff h (acc :< x) t
         else case acc of
           [<] => fail p
@@ -280,8 +293,12 @@ tagToken ('!' :: cs) = sh [<] True cs
     sh : SnocList Char -> (word : Bool) -> AutoTok YErr (Either Tag (String, String))
     sh acc word ('!' :: t) =
       if word then suff ("!" ++ cast acc ++ "!") [<] t else fail p
+    sh acc word ('%' :: x :: y :: t) =
+      if isHexDigit x && isHexDigit y
+        then sh (acc :< chr (cast $ hexDigit x * 16 + hexDigit y)) False t
+        else invalidEscape p t
     sh acc word (x :: t)  =
-      if isTagChar x
+      if isTagChar x && x /= '%'
         then sh (acc :< x) (word && isWordChar x) t
         else case acc of
           [<] => Succ (Left NonSpec) (x :: t)
@@ -390,6 +407,7 @@ doubleQuoted mi ('"' :: cs) = go [<] [<] cs
     escChar 'a'  = Just '\x07'
     escChar 'b'  = Just '\b'
     escChar 't'  = Just '\t'
+    escChar '\t' = Just '\t'
     escChar 'n'  = Just '\n'
     escChar 'v'  = Just '\x0b'
     escChar 'f'  = Just '\x0c'
@@ -521,14 +539,16 @@ blockScalar folded mi (c :: cs) = hdr Nothing Nothing cs
     -- to be detected (tracking the deepest empty line seen so far)
     data Ci = Fixed Nat | Auto Nat
 
-    -- classification of the next line, without consuming it
-    data PLine = PBlank Nat | PEnd | PCont Nat Bool
+    -- classification of the next line, without consuming it: an empty
+    -- line, white space before the end of input, or content (with a
+    -- document marker or tab flag)
+    data PLine = PBlank Nat | PEnd Nat | PCont Nat Bool Bool
 
     peek : Nat -> List Char -> PLine
     peek n (' '  :: t) = peek (S n) t
     peek n ('\n' :: _) = PBlank n
-    peek n []          = PEnd
-    peek n cs2         = PCont n (n == 0 && isDocMarker cs2)
+    peek n []          = PEnd n
+    peek n cs2@(x :: _) = PCont n (n == 0 && isDocMarker cs2) (x == '\t')
 
     startCi : Maybe Nat -> Ci
     startCi Nothing  = Auto 0
@@ -541,22 +561,33 @@ blockScalar folded mi (c :: cs) = hdr Nothing Nothing cs
            Chomp -> Ci -> (prev : Maybe Bool) -> (acc : SnocList Char)
         -> (brk : Nat) -> AutoTok YErr String
       atLine ch ci prev acc brk cs2 = case peek 0 cs2 of
-        PEnd     => Succ (fin ch acc brk) cs2
+        PEnd n => case ci of
+          -- trailing white space before the end of input: a content
+          -- line of spaces if more indented, an empty line otherwise
+          Fixed n2 =>
+            if n > n2
+              then capture ch n2 prev acc brk 0 [<] cs2
+              else Succ (fin ch acc (if n > 0 then S brk else brk)) cs2
+          Auto _ => Succ (fin ch acc (if n > 0 then S brk else brk)) cs2
         PBlank n => case ci of
           Auto mb => blank ch (Auto $ max mb n) prev acc brk cs2
           Fixed n2 =>
             if n > n2
               then capture ch n2 prev acc brk 0 [<] cs2
               else blank ch (Fixed n2) prev acc brk cs2
-        PCont n marker => case ci of
+        PCont n marker tab => case ci of
           Auto mb =>
-            if n < mi || marker
+            if tab && n < mi
+              then range (Custom TabIndent) p cs2
+            else if n < mi || marker
               then Succ (fin ch acc brk) cs2
             else if mb > n
               then fail Same
             else capture ch n prev acc brk 0 [<] cs2
           Fixed n2 =>
-            if n < n2
+            if tab && n < n2
+              then range (Custom TabIndent) p cs2
+            else if n < n2 || marker
               then Succ (fin ch acc brk) cs2
               else capture ch n2 prev acc brk 0 [<] cs2
 
@@ -586,8 +617,10 @@ blockScalar folded mi (c :: cs) = hdr Nothing Nothing cs
         let spaced := m > n
          in atLine ch (Fixed n) (Just spaced) (contrib prev brk spaced acc line) 1 t
       capture ch n prev acc brk m line [] =
+        -- a content line ending at the end of input still counts as
+        -- ended by a break for chomping [spec: b-chomped-last]
         let spaced := m > n
-         in Succ (fin ch (contrib prev brk spaced acc line) 0) []
+         in Succ (fin ch (contrib prev brk spaced acc line) 1) []
       capture ch n prev acc brk m line (x :: t) =
         if isControl x
           then single (InvalidControl x) p
@@ -605,7 +638,7 @@ blockScalar folded mi (c :: cs) = hdr Nothing Nothing cs
           then single (InvalidControl x) p
           else capLine ch n prev acc brk spaced (line :< x) t
       capLine ch n prev acc brk spaced line [] =
-        Succ (fin ch (contrib prev brk spaced acc line) 0) []
+        Succ (fin ch (contrib prev brk spaced acc line) 1) []
 
       -- the header: at most one indentation digit and one chomping
       -- indicator, optional comment, then the first line break
