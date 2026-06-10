@@ -183,6 +183,28 @@ data YErr : Type where
   TrailingContent : YErr
   InvalidKey      : YErr
 
+  -- composer errors
+
+  ||| An alias referencing an anchor that is not in scope.
+  UndefinedAlias  : Anchor -> YErr
+
+  ||| An alias referencing an anchor whose node is still being
+  ||| composed, as in `&a [*a]`: such cyclic structures cannot be
+  ||| represented as finite trees.
+  CyclicAlias     : Anchor -> YErr
+
+  ||| A mapping with two equal keys [spec 3.2.1.3]. Carries the
+  ||| rendered key.
+  DuplicateKey    : String -> YErr
+
+  ||| The composer met a malformed event sequence. Event streams
+  ||| produced by `parseEvents` never trigger this. Carries the
+  ||| rendered event.
+  UnexpectedEvent : String -> YErr
+
+  ||| The events ended in the middle of a node or document.
+  UnexpectedEnd   : YErr
+
 %runElab derive "YErr" [Show,Eq]
 
 ||| Resolves a tag shorthand against the active handles
@@ -217,3 +239,8 @@ Interpolation YErr where
   interpolate (BadDirective d)    = "invalid directive: \{d}"
   interpolate TrailingContent     = "content not allowed after document end"
   interpolate InvalidKey          = "invalid mapping key"
+  interpolate (UndefinedAlias a)  = "undefined alias: *\{a}"
+  interpolate (CyclicAlias a)     = "alias *\{a} refers to its own ancestor"
+  interpolate (DuplicateKey k)    = "duplicate mapping key: \{k}"
+  interpolate (UnexpectedEvent e) = "unexpected event: \{e}"
+  interpolate UnexpectedEnd       = "unexpected end of events"

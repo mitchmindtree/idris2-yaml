@@ -4,64 +4,11 @@ import Data.List.Suffix
 import Data.List.Suffix.Result0
 import Data.SortedMap
 import Data.SortedSet
-import Derive.Prelude
 import Text.YAML.Parser
 import public Text.YAML.Node
 import public Text.YAML.Types
 
 %default total
-%language ElabReflection
-
---------------------------------------------------------------------------------
---          Errors
---------------------------------------------------------------------------------
-
-||| Errors composing an event stream into node trees.
-|||
-||| Compose errors carry no source positions: events do not remember
-||| where they were parsed.
-public export
-data ComposeErr : Type where
-  ||| The event sequence is malformed. Streams produced by
-  ||| `parseEvents` never trigger this.
-  UnexpectedEvent : Event -> ComposeErr
-
-  ||| The events ended in the middle of a node or document.
-  UnexpectedEnd   : ComposeErr
-
-  ||| An alias referencing an anchor that is not in scope.
-  UndefinedAlias  : Anchor -> ComposeErr
-
-  ||| An alias referencing an anchor whose node is still being
-  ||| composed, as in `&a [*a]`: such cyclic structures cannot be
-  ||| represented as finite trees.
-  CyclicAlias     : Anchor -> ComposeErr
-
-  ||| A mapping with two equal keys [spec 3.2.1.3].
-  DuplicateKey    : Node -> ComposeErr
-
-%runElab derive "ComposeErr" [Show,Eq]
-
-export
-Interpolation ComposeErr where
-  interpolate (UnexpectedEvent e) = "unexpected event: \{printEvent e}"
-  interpolate UnexpectedEnd       = "unexpected end of events"
-  interpolate (UndefinedAlias a)  = "undefined alias: *\{a}"
-  interpolate (CyclicAlias a)     = "alias *\{a} refers to its own ancestor"
-  interpolate (DuplicateKey k)    = "duplicate mapping key: \{canon k}"
-
-||| Errors loading YAML documents: parsing or composing.
-public export
-data YAMLErr : Type where
-  YParse   : ParseError YErr -> YAMLErr
-  YCompose : ComposeErr -> YAMLErr
-
-%runElab derive "YAMLErr" [Show,Eq]
-
-export
-Interpolation YAMLErr where
-  interpolate (YParse e)   = interpolate e
-  interpolate (YCompose e) = interpolate e
 
 --------------------------------------------------------------------------------
 --          Composing
@@ -83,16 +30,17 @@ hasKey k [<]              = False
 hasKey k (ps :< (k2, _))  = k == k2 || hasKey k ps
 
 ||| A composing rule over the remaining events, consuming a strict
-||| prefix when `b` is `True`.
+||| prefix when `b` is `True`. Errors carry the bounds of the events
+||| they refer to.
 |||
 ||| Totality: unlike the character-level parser, every node consumes at
 ||| least one event, so all rules below are strict and the `SuffixAcc`
 ||| recursion is straightforward.
 0 CRule : Bool -> Type -> Type
 CRule b a =
-     (es : List Event)
+     (es : List (Bounded Event))
   -> (0 acc : SuffixAcc es)
-  -> Result0 b Event es ComposeErr a
+  -> Result0 b (Bounded Event) es (BoundedErr YErr) a
 
 -- Anchors become visible once their node is complete: scalars insert
 -- immediately, collections only after their children have composed, so
@@ -101,65 +49,68 @@ CRule b a =
 -- still open collections; it flows downward only (lexical scoping) and
 -- serves to distinguish `CyclicAlias` from `UndefinedAlias`.
 mutual
-  ||| A single node: scalar, alias, sequence or mapping.
+  ||| A single node: scalar, alias, sequence or mapping. Returns the
+  ||| node together with its full source span.
   node :
        Schema
     -> Anchors
     -> (live : SortedSet Anchor)
-    -> CRule True (Node, Anchors)
-  node sch as live (Scalar ma t sty s :: es) _ =
+    -> CRule True (Node, Bounds, Anchors)
+  node sch as live (B (Scalar ma t sty s) bs :: es) _ =
     let n := NScalar (scalarTag sch t sty s) sty s
-     in Succ0 (n, anchored ma n as) es
-  node sch as live (Alias a :: es) _ = case lookup a as of
-    Just n  => Succ0 (n, as) es
+     in Succ0 (n, bs, anchored ma n as) es
+  node sch as live (B (Alias a) bs :: es) _ = case lookup a as of
+    Just n  => Succ0 (n, bs, as) es
     Nothing =>
-      Fail0 $ if contains a live then CyclicAlias a else UndefinedAlias a
-  node sch as live (SeqStart _ ma t :: es) (SA r) =
+      custom bs $ if contains a live then CyclicAlias a else UndefinedAlias a
+  node sch as live (B (SeqStart _ ma t) bs :: es) (SA r) =
     case seqItems sch as (livePlus ma live) [<] es (r @{uncons Same}) of
       Fail0 e => Fail0 e
-      Succ0 (ns, as2) rest @{q} =>
+      Succ0 (ns, be, as2) rest @{q} =>
         let n := NSeq (collTag sch t TSeq) ns
-         in Succ0 (n, anchored ma n as2) rest @{trans q (uncons Same)}
-  node sch as live (MapStart _ ma t :: es) (SA r) =
+         in Succ0 (n, bs <+> be, anchored ma n as2) rest @{trans q (uncons Same)}
+  node sch as live (B (MapStart _ ma t) bs :: es) (SA r) =
     case mapItems sch as (livePlus ma live) [<] es (r @{uncons Same}) of
       Fail0 e => Fail0 e
-      Succ0 (ps, as2) rest @{q} =>
+      Succ0 (ps, be, as2) rest @{q} =>
         let n := NMap (collTag sch t TMap) ps
-         in Succ0 (n, anchored ma n as2) rest @{trans q (uncons Same)}
-  node _ _ _ (e :: _) _ = Fail0 (UnexpectedEvent e)
-  node _ _ _ []       _ = Fail0 UnexpectedEnd
+         in Succ0 (n, bs <+> be, anchored ma n as2) rest @{trans q (uncons Same)}
+  node _ _ _ (B e bs :: _) _ = custom bs (UnexpectedEvent (printEvent e))
+  node _ _ _ []            _ = custom NoBounds UnexpectedEnd
 
-  ||| The remaining entries of a sequence, up to its end event.
+  ||| The remaining entries of a sequence, up to its end event, whose
+  ||| bounds are returned.
   seqItems :
        Schema
     -> Anchors
     -> SortedSet Anchor
     -> SnocList Node
-    -> CRule True (List Node, Anchors)
-  seqItems sch as live acc (SeqEnd :: es) _ = Succ0 (acc <>> [], as) es
-  seqItems sch as live acc []             _ = Fail0 UnexpectedEnd
-  seqItems sch as live acc es sa@(SA r)     = case node sch as live es sa of
+    -> CRule True (List Node, Bounds, Anchors)
+  seqItems sch as live acc (B SeqEnd be :: es) _ = Succ0 (acc <>> [], be, as) es
+  seqItems sch as live acc []                  _ = custom NoBounds UnexpectedEnd
+  seqItems sch as live acc es sa@(SA r)          = case node sch as live es sa of
     Fail0 e => Fail0 e
-    Succ0 (n, as2) rest @{q} =>
+    Succ0 (n, _, as2) rest @{q} =>
       succT $ seqItems sch as2 live (acc :< n) rest (r @{q})
 
-  ||| The remaining entries of a mapping, up to its end event.
+  ||| The remaining entries of a mapping, up to its end event, whose
+  ||| bounds are returned.
   mapItems :
        Schema
     -> Anchors
     -> SortedSet Anchor
     -> SnocList (Node, Node)
-    -> CRule True (List (Node, Node), Anchors)
-  mapItems sch as live acc (MapEnd :: es) _ = Succ0 (acc <>> [], as) es
-  mapItems sch as live acc []             _ = Fail0 UnexpectedEnd
-  mapItems sch as live acc es sa@(SA r)     = case node sch as live es sa of
+    -> CRule True (List (Node, Node), Bounds, Anchors)
+  mapItems sch as live acc (B MapEnd be :: es) _ = Succ0 (acc <>> [], be, as) es
+  mapItems sch as live acc []                  _ = custom NoBounds UnexpectedEnd
+  mapItems sch as live acc es sa@(SA r)          = case node sch as live es sa of
     Fail0 e => Fail0 e
-    Succ0 (k, as2) rest @{q} =>
+    Succ0 (k, kbs, as2) rest @{q} =>
       if hasKey k acc
-        then Fail0 (DuplicateKey k)
+        then custom kbs (DuplicateKey (canon k))
         else case node sch as2 live rest (r @{q}) of
           Fail0 e => Fail0 e
-          Succ0 (v, as3) rest2 @{q2} =>
+          Succ0 (v, _, as3) rest2 @{q2} =>
             let 0 pp := trans q2 q
              in succT $ mapItems sch as3 live (acc :< (k, v)) rest2 (r @{pp})
 
@@ -172,46 +123,51 @@ mutual
 ||| tags of untagged nodes are resolved against the given schema, and
 ||| mapping keys are checked for uniqueness. Anchors are scoped to
 ||| their document; redefining an anchor shadows the previous node.
+|||
+||| Errors carry the source bounds of the events they refer to; pair
+||| them with the (line break normalized) input via `toParseError` for
+||| a rendered excerpt, or use `parseDocsWith`, which does so.
 export
-composeWith : Schema -> List Event -> Either ComposeErr (List Node)
-composeWith sch (StreamStart :: es) = go [<] es suffixAcc
+composeWith : Schema -> List (Bounded Event) -> Either (BoundedErr YErr) (List Node)
+composeWith sch (B StreamStart _ :: es) = go [<] es suffixAcc
   where
     go :
          SnocList Node
-      -> (es : List Event)
+      -> (es : List (Bounded Event))
       -> (0 acc : SuffixAcc es)
-      -> Either ComposeErr (List Node)
-    go acc (StreamEnd :: [])     _      = Right (acc <>> [])
-    go acc (StreamEnd :: e :: _) _      = Left (UnexpectedEvent e)
-    go acc (DocStart _ :: es2)   (SA r) =
+      -> Either (BoundedErr YErr) (List Node)
+    go acc (B StreamEnd _ :: [])          _      = Right (acc <>> [])
+    go acc (B StreamEnd _ :: B e bs :: _) _      =
+      custom bs (UnexpectedEvent (printEvent e))
+    go acc (B (DocStart _) _ :: es2)      (SA r) =
       case node sch empty empty es2 (r @{uncons Same}) of
         Fail0 e => Left e
-        Succ0 (n, _) (DocEnd _ :: rest) @{q} =>
+        Succ0 (n, _, _) (B (DocEnd _) _ :: rest) @{q} =>
           let 0 pp := trans (uncons q) (uncons Same)
            in go (acc :< n) rest (r @{pp})
-        Succ0 _ (e :: _) => Left (UnexpectedEvent e)
-        Succ0 _ []       => Left UnexpectedEnd
-    go acc (e :: _) _ = Left (UnexpectedEvent e)
-    go acc []       _ = Left UnexpectedEnd
-composeWith _ (e :: _) = Left (UnexpectedEvent e)
-composeWith _ []       = Left UnexpectedEnd
+        Succ0 _ (B e bs :: _) => custom bs (UnexpectedEvent (printEvent e))
+        Succ0 _ []            => custom NoBounds UnexpectedEnd
+    go acc (B e bs :: _) _ = custom bs (UnexpectedEvent (printEvent e))
+    go acc []            _ = custom NoBounds UnexpectedEnd
+composeWith _ (B e bs :: _) = custom bs (UnexpectedEvent (printEvent e))
+composeWith _ []            = custom NoBounds UnexpectedEnd
 
 ||| `composeWith` under the core schema.
 export %inline
-compose : List Event -> Either ComposeErr (List Node)
+compose : List (Bounded Event) -> Either (BoundedErr YErr) (List Node)
 compose = composeWith Core
 
 ||| Parses and composes a YAML stream into one node tree per document.
 export
-parseDocsWith : Schema -> Origin -> String -> Either YAMLErr (List Node)
+parseDocsWith : Schema -> Origin -> String -> Either (ParseError YErr) (List Node)
 parseDocsWith sch o s =
   case parseEvents o s of
-    Left e   => Left (YParse e)
+    Left e   => Left e
     Right es => case composeWith sch es of
-      Left e   => Left (YCompose e)
+      Left e   => Left (toParseError o (normalized s) e)
       Right ns => Right ns
 
 ||| `parseDocsWith` under the core schema.
 export %inline
-parseDocs : Origin -> String -> Either YAMLErr (List Node)
+parseDocs : Origin -> String -> Either (ParseError YErr) (List Node)
 parseDocs = parseDocsWith Core

@@ -17,7 +17,7 @@ import Text.YAML
 --          YAML Test Suite Runner
 --------------------------------------------------------------------------------
 
-parseStr : String -> Either String (List Event)
+parseStr : String -> Either String (List (Bounded Event))
 parseStr = mapFst interpolate . parseEvents Virtual
 
 --------------------------------------------------------------------------------
@@ -95,11 +95,11 @@ data JState = NoJson | Compared | JSkipped
 
 -- Composes the events and compares the documents' JSON interpretation
 -- against the case's in.json content.
-checkJSON : (events : List Event) -> (inJson : String) -> (JState, Maybe String)
+checkJSON : (events : List (Bounded Event)) -> (inJson : String) -> (JState, Maybe String)
 checkJSON evs js = case jsonDocs js of
   Nothing  => (Compared, Just "cannot split in.json into documents")
   Just exp => case compose evs of
-    Left e     => (Compared, Just "compose error: \{e}")
+    Left (B err bs) => (Compared, Just "compose error: \{err} at \{bs}")
     Right docs => case toJSONs [<] docs of
       Nothing  => (JSkipped, Nothing)
       Just got => (Compared, jsonDiff exp got)
@@ -209,7 +209,7 @@ runCase suite id = do
       False => do
         Right expected <- readFile "\{dir}/test.event"
           | Left err => pure (CR id False NoJson "cannot read test.event: \{show err}")
-        case firstDiff (lines expected) (map printEvent evs) of
+        case firstDiff (lines expected) (map (printEvent . val) evs) of
           Just d  => pure (CR id False NoJson d)
           Nothing => do
             -- events match; check the composed documents where the
@@ -330,7 +330,7 @@ prop_parsedEventsBalanced = property $ do
   s <- forAll (string (linear 0 60) yamlChar)
   case parseEvents Virtual s of
     Left _    => assert True
-    Right evs => assert (balanced evs)
+    Right evs => assert (balanced (map (.val) evs))
 
 properties : Group
 properties =
@@ -383,20 +383,28 @@ prop_aliasSharing = withTests 1 $ property $
   parseDocs Virtual "[&a x, *a]" ===
     Right [NSeq TSeq [scalar TStr "x", scalar TStr "x"]]
 
+-- the error (and, in the next properties, its source span) of a
+-- failing parseDocs run
+failure : Either (ParseError YErr) (List Node) -> Maybe (InnerError YErr, Bounds)
+failure (Left e) = Just (e.error, e.bounds)
+failure _        = Nothing
+
 prop_cyclicAlias : Property
 prop_cyclicAlias = withTests 1 $ property $
-  parseDocs Virtual "&a [*a]" === Left (YCompose (CyclicAlias "a"))
+  map fst (failure $ parseDocs Virtual "&a [*a]") ===
+    Just (Custom (CyclicAlias "a"))
 
 prop_undefinedAlias : Property
 prop_undefinedAlias = withTests 1 $ property $
-  parseDocs Virtual "[*nope]" === Left (YCompose (UndefinedAlias "nope"))
+  map fst (failure $ parseDocs Virtual "[*nope]") ===
+    Just (Custom (UndefinedAlias "nope"))
 
 -- the plain key `a` and the quoted key "a" are equal: styles do not
 -- distinguish keys
 prop_dupKeyAcrossStyles : Property
 prop_dupKeyAcrossStyles = withTests 1 $ property $
-  parseDocs Virtual "{a: 1, \"a\": 2}" ===
-    Left (YCompose (DuplicateKey (scalar TStr "a")))
+  map fst (failure $ parseDocs Virtual "{a: 1, \"a\": 2}") ===
+    Just (Custom (DuplicateKey "\"a\""))
 
 prop_anchorShadowing : Property
 prop_anchorShadowing = withTests 1 $ property $
