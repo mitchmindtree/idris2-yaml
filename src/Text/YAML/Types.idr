@@ -1,5 +1,6 @@
 module Text.YAML.Types
 
+import Data.List
 import Derive.Prelude
 import public Text.ParseError
 
@@ -132,6 +133,38 @@ printEvent (Scalar a t s v) =
 printEvent (Alias a)        = "=ALI *" ++ a
 
 --------------------------------------------------------------------------------
+--          Node Properties and Tag Resolution
+--------------------------------------------------------------------------------
+
+||| The properties of a node: at most one anchor and one tag
+||| [spec: c-ns-properties].
+public export
+record Props where
+  constructor MkProps
+  anchor : Maybe Anchor
+  tag    : Tag
+
+public export
+noProps : Props
+noProps = MkProps Nothing NoTag
+
+public export
+isNoProps : Props -> Bool
+isNoProps (MkProps Nothing NoTag) = True
+isNoProps _                       = False
+
+||| The tag handles declared by `%TAG` directives; `!` and `!!` have
+||| built-in defaults.
+public export
+record TagEnv where
+  constructor TE
+  handles : List (String, String)
+
+public export
+defaultEnv : TagEnv
+defaultEnv = TE []
+
+--------------------------------------------------------------------------------
 --          Errors
 --------------------------------------------------------------------------------
 
@@ -151,6 +184,26 @@ data YErr : Type where
   InvalidKey      : YErr
 
 %runElab derive "YErr" [Show,Eq]
+
+||| Resolves a tag shorthand against the active handles
+||| [spec: c-ns-shorthand-tag].
+export
+resolveTag : TagEnv -> (handle, suffix : String) -> Either YErr Tag
+resolveTag env h sfx = case lookup h env.handles of
+  Just pre => Right (Verbatim (pre ++ sfx))
+  Nothing  => case h of
+    "!"  => Right (Verbatim ("!" ++ sfx))
+    "!!" => Right (Verbatim ("tag:yaml.org,2002:" ++ sfx))
+    _    => Left (UnknownHandle h)
+
+||| Combines properties given on a preceding line with those attached
+||| directly to a node: at most one anchor and one tag in total.
+export
+mergeProps : Props -> Props -> Either YErr Props
+mergeProps (MkProps (Just _) _) (MkProps (Just _) _) = Left MultipleAnchors
+mergeProps (MkProps a1 NoTag) (MkProps a2 t)         = Right (MkProps (a1 <|> a2) t)
+mergeProps (MkProps a1 t) (MkProps a2 NoTag)         = Right (MkProps (a1 <|> a2) t)
+mergeProps _ _                                       = Left MultipleTags
 
 export
 Interpolation YErr where

@@ -181,6 +181,132 @@ inlineWhite cs = go 0 cs Same
     go n rem         p = IL n rem p
 
 --------------------------------------------------------------------------------
+--          Anchors and Tags
+--------------------------------------------------------------------------------
+
+||| May the given character occur in a URI [spec: ns-uri-char]?
+public export
+isUriChar : Char -> Bool
+isUriChar '#'  = True
+isUriChar ';'  = True
+isUriChar '/'  = True
+isUriChar '?'  = True
+isUriChar ':'  = True
+isUriChar '@'  = True
+isUriChar '&'  = True
+isUriChar '='  = True
+isUriChar '+'  = True
+isUriChar '$'  = True
+isUriChar ','  = True
+isUriChar '-'  = True
+isUriChar '_'  = True
+isUriChar '.'  = True
+isUriChar '!'  = True
+isUriChar '~'  = True
+isUriChar '*'  = True
+isUriChar '\'' = True
+isUriChar '('  = True
+isUriChar ')'  = True
+isUriChar '['  = True
+isUriChar ']'  = True
+isUriChar '%'  = True
+isUriChar c    = isAlphaNum c
+
+||| A word character [spec: ns-word-char], as used in tag handles.
+public export
+isWordChar : Char -> Bool
+isWordChar '-' = True
+isWordChar c   = isAlphaNum c
+
+||| A character of a tag shorthand's suffix [spec: ns-tag-char].
+public export
+isTagChar : Char -> Bool
+isTagChar '!' = False
+isTagChar c   = isUriChar c && not (isFlowInd c)
+
+||| An anchor or alias name [spec: ns-anchor-name], starting at its
+||| `&` or `*` indicator.
+export
+anchorName : Tok True YErr String
+anchorName (c :: cs) = go [<] cs
+
+  where
+    go : SnocList Char -> AutoTok YErr String
+    go acc (x :: xs) =
+      if isPlainSafe True x
+        then go (acc :< x) xs
+        else case acc of
+          [<] => fail p
+          _   => Succ (cast acc) (x :: xs)
+    go acc [] = case acc of
+      [<] => fail p
+      _   => Succ (cast acc) []
+
+anchorName [] = eoiAt Same
+
+||| A tag property [spec: c-ns-tag-property], starting at its `!`
+||| indicator: verbatim (`!<...>`), a shorthand to be resolved against
+||| the active tag handles, or the non-specific tag `!`.
+export
+tagToken : Tok True YErr (Either Tag (String, String))
+tagToken ('!' :: '<' :: cs) = verb [<] cs
+
+  where
+    verb : SnocList Char -> AutoTok YErr (Either Tag (String, String))
+    verb acc ('>' :: t) = case acc of
+      [<] => fail p
+      _   => Succ (Left (Verbatim (cast acc))) t
+    verb acc (x :: t)   =
+      if isUriChar x then verb (acc :< x) t else fail p
+    verb acc []         = eoiAt p
+
+tagToken ('!' :: cs) = sh [<] True cs
+
+  where
+    -- the suffix after a named or secondary handle
+    suff : String -> SnocList Char -> AutoTok YErr (Either Tag (String, String))
+    suff h acc (x :: t) =
+      if isTagChar x
+        then suff h (acc :< x) t
+        else case acc of
+          [<] => fail p
+          _   => Succ (Right (h, cast acc)) (x :: t)
+    suff h acc [] = case acc of
+      [<] => fail p
+      _   => Succ (Right (h, cast acc)) []
+
+    -- the shorthand: tag characters, possibly closing a handle with a
+    -- second `!`
+    sh : SnocList Char -> (word : Bool) -> AutoTok YErr (Either Tag (String, String))
+    sh acc word ('!' :: t) =
+      if word then suff ("!" ++ cast acc ++ "!") [<] t else fail p
+    sh acc word (x :: t)  =
+      if isTagChar x
+        then sh (acc :< x) (word && isWordChar x) t
+        else case acc of
+          [<] => Succ (Left NonSpec) (x :: t)
+          _   => Succ (Right ("!", cast acc)) (x :: t)
+    sh acc word [] = case acc of
+      [<] => Succ (Left NonSpec) []
+      _   => Succ (Right ("!", cast acc)) []
+
+tagToken cs = fail Same
+
+||| A whole directive line including its line break (the break is not
+||| part of the result).
+export
+dirLine : Tok True YErr String
+dirLine (c :: cs) = go [<c] cs
+
+  where
+    go : SnocList Char -> AutoTok YErr String
+    go acc ('\n' :: t) = Succ (cast acc) t
+    go acc (x :: t)    = go (acc :< x) t
+    go acc []          = Succ (cast acc) []
+
+dirLine [] = eoiAt Same
+
+--------------------------------------------------------------------------------
 --          Quoted Scalars
 --------------------------------------------------------------------------------
 

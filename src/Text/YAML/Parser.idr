@@ -23,22 +23,41 @@ record YState where
 emit : Event -> YState -> YState
 emit e = {evs $= (:< e)}
 
-||| An empty node, e.g. the missing value in `key:` [spec: e-scalar].
+||| An empty node with the given properties [spec: e-scalar].
+%inline
+emptyScalarP : Props -> SnocList Event -> SnocList Event
+emptyScalarP pr = (:< Scalar pr.anchor pr.tag Plain "")
+
 %inline
 emptyScalar : SnocList Event -> SnocList Event
-emptyScalar = (:< Scalar Nothing NoTag Plain "")
+emptyScalar = emptyScalarP noProps
 
 ||| An inline node candidate for implicit-key detection: a single-line
-||| plain scalar (its event not yet emitted, since it might yet grow by
-||| line folding), or a flow collection parsed into its own event
+||| scalar (its event not yet emitted, since a plain scalar might yet
+||| grow by line folding), an alias, node properties not followed by
+||| inline content, or a flow collection parsed into its own event
 ||| buffer.
 data Pending : Type where
-  PScalar : Style -> String -> Pending
+  PScalar : Props -> Style -> String -> Pending
+  PAlias  : Anchor -> Pending
+  PProps  : Props -> Pending
   PFlow   : SnocList Event -> Pending
 
 flushPend : SnocList Event -> Pending -> SnocList Event
-flushPend evs (PScalar sty s) = evs :< Scalar Nothing NoTag sty s
-flushPend evs (PFlow d)       = evs ++ d
+flushPend evs (PScalar pr sty s) = evs :< Scalar pr.anchor pr.tag sty s
+flushPend evs (PAlias a)         = evs :< Alias a
+flushPend evs (PProps pr)        = evs :< Scalar pr.anchor pr.tag Plain ""
+flushPend evs (PFlow d)          = evs ++ d
+
+||| Attaches properties from a preceding line to a flow collection's
+||| opening event.
+patchFlow : Props -> SnocList Event -> Either YErr (SnocList Event)
+patchFlow pr evs = case evs <>> [] of
+  SeqStart f a t :: es =>
+    (\p => [<] <>< (SeqStart f p.anchor p.tag :: es)) <$> mergeProps pr (MkProps a t)
+  MapStart f a t :: es =>
+    (\p => [<] <>< (MapStart f p.anchor p.tag :: es)) <$> mergeProps pr (MkProps a t)
+  _ => Right evs
 
 -- Is the next token a `:` value indicator in block context?
 colonBlock : List Char -> Bool
@@ -60,6 +79,27 @@ plainSafeNext : List Char -> Bool
 plainSafeNext (c :: _) = isPlainSafe True c
 plainSafeNext []       = False
 
+-- Can an inline node candidate start here?
+candStart : (inFlow : Bool) -> List Char -> Bool
+candStart inFlow (c :: cs) =
+  c == '[' || c == '{' || c == '\'' || c == '"' || c == '*' ||
+  isPlainFirst inFlow c cs
+candStart _ [] = False
+
+-- Does a block scalar start here? Returns whether it is folded.
+bsStart : List Char -> Maybe Bool
+bsStart ('|' :: _) = Just False
+bsStart ('>' :: _) = Just True
+bsStart _          = Nothing
+
+breakStart : List Char -> Bool
+breakStart (c :: _) = isBreak c || c == '#'
+breakStart []       = False
+
+propStart : List Char -> Bool
+propStart (c :: _) = c == '&' || c == '!'
+propStart []       = False
+
 --------------------------------------------------------------------------------
 --          Rule Type
 --------------------------------------------------------------------------------
@@ -70,12 +110,12 @@ plainSafeNext []       = False
 ||| Totality: all recursion in the rules below runs over the strictly
 ||| shrinking character list via `SuffixAcc`. Since some nodes may be
 ||| empty (consuming nothing), every loop derives its strictness from a
-||| separator it consumed itself (a comma, colon, dash, or line break)
-||| before recursing. Lookahead over blank and comment lines
+||| separator it consumed itself (a comma, colon, dash, marker, or line
+||| break) before recursing. Lookahead over blank and comment lines
 ||| (`skipToContent`) returns a non-erased, possibly-empty `Suffix`:
-||| where a rule continues after such a skip, it matches `Same`/`Uncons`
-||| explicitly so the recursion goes through a projection of its
-||| `SuffixAcc` argument.
+||| where a rule continues after such a skip without other consumption,
+||| it matches `Same`/`Uncons` explicitly so the recursion goes through
+||| a projection of its `SuffixAcc` argument.
 public export
 0 Rule : Bool -> Type -> Type
 Rule b a =
@@ -83,6 +123,56 @@ Rule b a =
   -> (cs : List Char)
   -> (0 acc : SuffixAcc cs)
   -> Result0 b Char cs (BoundedErr YErr) a
+
+--------------------------------------------------------------------------------
+--          Node Properties
+--------------------------------------------------------------------------------
+
+||| Parses node properties [spec: c-ns-properties]: an anchor and a tag
+||| in either order, separated by white space within the line. Must be
+||| called at a `&` or `!`.
+pProps :
+     TagEnv
+  -> Props
+  -> Position
+  -> (cs : List Char)
+  -> (0 a : SuffixAcc cs)
+  -> Result0 True Char cs (BoundedErr YErr) (Props, Position)
+pProps env pr pos ('&' :: cs) sa@(SA r) = case pr.anchor of
+  Just _  => custom (oneChar pos) MultipleAnchors
+  Nothing => case anchorName ('&' :: cs) of
+    Succ nm rem @{prf} =>
+      let IL cnt rem2 w := inlineWhite rem
+          pos2 := addCol cnt (move pos prf)
+          pr2  := {anchor := Just nm} pr
+          0 pp := trans w prf
+       in if propStart rem2
+            then succT (pProps env pr2 pos2 rem2 (r @{pp})) @{pp}
+            else Succ0 (pr2, pos2) rem2 @{pp}
+    Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
+pProps env pr pos ('!' :: cs) sa@(SA r) = case pr.tag of
+  NoTag => case tagToken ('!' :: cs) of
+    Succ et rem @{prf} =>
+      let pos1 := move pos prf
+       in case resolved et of
+            Left e   => custom (BS pos pos1) e
+            Right tg =>
+              let IL cnt rem2 w := inlineWhite rem
+                  pr2  := {tag := tg} pr
+                  0 pp := trans w prf
+               in if propStart rem2
+                    then succT (pProps env pr2 (addCol cnt pos1) rem2 (r @{pp})) @{pp}
+                    else Succ0 (pr2, addCol cnt pos1) rem2 @{pp}
+    Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
+  _ => custom (oneChar pos) MultipleTags
+
+  where
+    resolved : Either Tag (String, String) -> Either YErr Tag
+    resolved (Left t)       = Right t
+    resolved (Right (h, s)) = resolveTag env h s
+pProps env pr pos [] _ = eoi
+pProps env pr pos (c :: cs) _ =
+  parseFail (oneChar pos) (Expected ["'&'", "'!'"] (pack [c]))
 
 --------------------------------------------------------------------------------
 --          Separation in Flow Context
@@ -150,9 +240,9 @@ lineEndC pos (c :: cs) =
     then Succ0 pos (c :: cs)
     else succF $ lineEndC (incCol pos) cs
 
--- After a node that ends within a line (a flow collection or quoted
--- scalar) in block context: only white space and a comment may follow
--- on the same line. Stops before the line break.
+-- After a node that ends within a line (a flow collection, quoted
+-- scalar or alias) in block context: only white space and a comment
+-- may follow on the same line. Stops before the line break.
 lineEnd : (sw : Bool) -> Position -> (cs : List Char) -> Result0 False Char cs (BoundedErr YErr) Position
 lineEnd sw pos [] = Succ0 pos []
 lineEnd sw pos (c :: cs) =
@@ -160,6 +250,44 @@ lineEnd sw pos (c :: cs) =
   else if isBreak c then Succ0 pos (c :: cs)
   else if c == '#' && sw then succF $ lineEndC (incCol pos) cs
   else custom (oneChar pos) TrailingContent
+
+--------------------------------------------------------------------------------
+--          Directives
+--------------------------------------------------------------------------------
+
+||| Interprets a directive line [spec: l-directive]: `%YAML` (at most
+||| once per document, major version 1), `%TAG` (no duplicate handles),
+||| anything else is reserved and ignored.
+parseDirective : TagEnv -> (sawYaml : Bool) -> String -> Either YErr (TagEnv, Bool)
+parseDirective env sy ln = case words ln of
+  ["%YAML", v]     =>
+    if sy then Left (BadDirective "duplicate %YAML directive")
+    else if versionOk (unpack v) then Right (env, True)
+    else Left (BadVersion v)
+  ("%YAML" :: _)   => Left (BadDirective ln)
+  ["%TAG", h, pre] => case lookup h env.handles of
+    Just _  => Left (DuplicateHandle h)
+    Nothing =>
+      if handleOk (unpack h)
+        then Right (TE ((h, pre) :: env.handles), sy)
+        else Left (BadDirective ln)
+  ("%TAG" :: _)    => Left (BadDirective ln)
+  _                => Right (env, sy)
+
+  where
+    versionOk : List Char -> Bool
+    versionOk ('1' :: '.' :: ds@(_ :: _)) = all isDigit ds
+    versionOk _                           = False
+
+    inner : List Char -> Bool
+    inner ['!']     = True
+    inner (c :: t)  = isWordChar c && inner t
+    inner []        = False
+
+    handleOk : List Char -> Bool
+    handleOk ['!']      = True
+    handleOk ('!' :: t) = inner t
+    handleOk _          = False
 
 --------------------------------------------------------------------------------
 --          Nodes
@@ -197,61 +325,86 @@ mutual
       fold 0 = " "
       fold k = replicate k '\n'
 
-  ||| An inline node candidate: a single-line plain scalar or a flow
-  ||| collection, parsed into its own event buffer so callers can
-  ||| detect implicit mapping keys.
+  ||| An inline node candidate: properties, an alias, a single-line
+  ||| scalar or a flow collection, parsed into its own event buffer so
+  ||| callers can detect implicit mapping keys.
   cand :
        (inFlow : Bool)
     -> (mi : Nat)
-    -> (pos : Position)
+    -> TagEnv
+    -> Props
+    -> Position
     -> (cs : List Char)
     -> (0 a : SuffixAcc cs)
     -> Result0 True Char cs (BoundedErr YErr) (Pending, Position)
-  cand inFlow mi pos [] _ = eoi
-  cand inFlow mi pos (c :: cs) sa =
-    if c == '[' || c == '{'
-      then case flowNode inFlow mi (YS pos [<]) (c :: cs) sa of
+  cand inFlow mi env pr pos [] _ = eoi
+  cand inFlow mi env pr pos (c :: cs) sa@(SA r) =
+    if c == '&' || c == '!'
+      then case pProps env pr pos (c :: cs) sa of
+        Fail0 e => Fail0 e
+        Succ0 (pr2, p1) r1 @{q1} =>
+          if candStart inFlow r1
+            then succT (cand inFlow mi env pr2 p1 r1 (r @{q1})) @{q1}
+            else Succ0 (PProps pr2, p1) r1 @{q1}
+    else if c == '*'
+      then
+        if isNoProps pr
+          then case anchorName (c :: cs) of
+            Succ nm rem @{prf}    => Succ0 (PAlias nm, move pos prf) rem
+            Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
+          else parseFail (oneChar pos) (Unknown "properties on alias node")
+    else if c == '[' || c == '{'
+      then case flowNode inFlow mi env pr (YS pos [<]) (c :: cs) sa of
         Fail0 e => Fail0 e
         Succ0 st1 r1 => Succ0 (PFlow st1.evs, st1.pos) r1
-      else if c == '\'' || c == '"'
-        then
-          let (tok, sty) := if c == '"'
-                              then (doubleQuoted mi, DoubleQ)
-                              else (singleQuoted mi, SingleQ)
-           in case tok (c :: cs) of
-                Succ s rem @{prf}     => Succ0 (PScalar sty s, endPos pos prf) rem
-                Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
-      else if isPlainFirst inFlow c cs
-        then case plainSegment inFlow (c :: cs) of
-          Succ s rem @{prf}     => Succ0 (PScalar Plain s, move pos prf) rem
-          Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
-        else parseFail (oneChar pos) (Unknown $ pack [c])
+    else if c == '\'' || c == '"'
+      then
+        let (tok, sty) := if c == '"'
+                            then (doubleQuoted mi, DoubleQ)
+                            else (singleQuoted mi, SingleQ)
+         in case tok (c :: cs) of
+              Succ s rem @{prf}     => Succ0 (PScalar pr sty s, endPos pos prf) rem
+              Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
+    else if isPlainFirst inFlow c cs
+      then case plainSegment inFlow (c :: cs) of
+        Succ s rem @{prf}     => Succ0 (PScalar pr Plain s, move pos prf) rem
+        Fail start errEnd err => Fail0 (boundedErr pos start errEnd err)
+      else parseFail (oneChar pos) (Unknown $ pack [c])
 
-  ||| A single flow node [spec: ns-flow-node]: a plain scalar (with
-  ||| line folding) or a flow collection. Expects the input to be at a
-  ||| content character.
-  flowNode : (inFlow : Bool) -> (mi : Nat) -> Rule True YState
-  flowNode inFlow mi st [] _ = eoi
-  flowNode inFlow mi st (c :: cs) (SA r) = case c of
+  ||| A single flow node [spec: ns-flow-node]: properties, an alias, a
+  ||| scalar or a flow collection. Expects the input to be at a content
+  ||| character.
+  flowNode : (inFlow : Bool) -> (mi : Nat) -> TagEnv -> Props -> Rule True YState
+  flowNode inFlow mi env pr st [] _ = eoi
+  flowNode inFlow mi env pr st (c :: cs) sa@(SA r) = case c of
+    '&' => flowProps inFlow mi env pr st (c :: cs) sa
+    '!' => flowProps inFlow mi env pr st (c :: cs) sa
+    '*' =>
+      if isNoProps pr
+        then case anchorName ('*' :: cs) of
+          Succ nm rem @{prf} =>
+            Succ0 (YS (move st.pos prf) (st.evs :< Alias nm)) rem @{prf}
+          Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
+        else parseFail (oneChar st.pos) (Unknown "properties on alias node")
     '[' => case flowSkip "[" (oneChar st.pos) mi False (incCol st.pos) cs of
       Fail0 e => Fail0 e
       Succ0 p1 r1 @{q1} =>
         let 0 pp := trans q1 (uncons Same)
-            st1  := YS p1 (st.evs :< SeqStart True Nothing NoTag)
-         in succT (flowSeq mi (oneChar st.pos) st1 r1 (r @{pp})) @{pp}
+            st1  := YS p1 (st.evs :< SeqStart True pr.anchor pr.tag)
+         in succT (flowSeq env mi (oneChar st.pos) st1 r1 (r @{pp})) @{pp}
     '{' => case flowSkip "{" (oneChar st.pos) mi False (incCol st.pos) cs of
       Fail0 e => Fail0 e
       Succ0 p1 r1 @{q1} =>
         let 0 pp := trans q1 (uncons Same)
-            st1  := YS p1 (st.evs :< MapStart True Nothing NoTag)
-         in succT (flowMap mi (oneChar st.pos) st1 r1 (r @{pp})) @{pp}
+            st1  := YS p1 (st.evs :< MapStart True pr.anchor pr.tag)
+         in succT (flowMap env mi (oneChar st.pos) st1 r1 (r @{pp})) @{pp}
     '\'' => case singleQuoted mi (c :: cs) of
       Succ s rem @{prf} =>
-        Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag SingleQ s)) rem
+        Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar pr.anchor pr.tag SingleQ s)) rem
       Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
     '"' => case doubleQuoted mi (c :: cs) of
       Succ s rem @{prf} =>
-        Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag DoubleQ s)) rem
+        Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar pr.anchor pr.tag DoubleQ s)) rem
       Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
     _   =>
       if isPlainFirst inFlow c cs
@@ -260,19 +413,38 @@ mutual
             case plainMore inFlow mi s (move st.pos prf) rem (r @{prf}) of
               Fail0 e => Fail0 e
               Succ0 (s2, p2) rem2 @{q2} =>
-                Succ0 (YS p2 (st.evs :< Scalar Nothing NoTag Plain s2)) rem2
+                Succ0 (YS p2 (st.evs :< Scalar pr.anchor pr.tag Plain s2)) rem2
                   @{trans q2 prf}
           Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
         else parseFail (oneChar st.pos) (Unknown $ pack [c])
 
+  ||| Properties of a flow node, then the node itself, which may sit on
+  ||| a following line or be empty.
+  flowProps : (inFlow : Bool) -> (mi : Nat) -> TagEnv -> Props -> Rule True YState
+  flowProps inFlow mi env pr st cs sa@(SA r) = case pProps env pr st.pos cs sa of
+    Fail0 e => Fail0 e
+    Succ0 (pr2, p1) r1 @{q1} =>
+      if candStart inFlow r1
+        then succT (flowNode inFlow mi env pr2 (YS p1 st.evs) r1 (r @{q1})) @{q1}
+        else if breakStart r1
+          then case skipToContent r1 of
+            SR (L ind LContent) r2 prf2 =>
+              if ind >= mi
+                then
+                  let 0 pp := trans prf2 q1
+                   in succT (flowNode inFlow mi env pr2 (YS (endPos p1 prf2) st.evs) r2 (r @{pp})) @{pp}
+                else custom (oneChar $ endPos p1 prf2) BadIndent
+            SR _ _ _ => Succ0 (YS p1 (emptyScalarP pr2 st.evs)) r1 @{q1}
+          else Succ0 (YS p1 (emptyScalarP pr2 st.evs)) r1 @{q1}
+
   ||| Inside a flow sequence [spec: c-flow-sequence], at a content
   ||| character: an entry (possibly a single `key: value` pair) or the
   ||| closing bracket.
-  flowSeq : (mi : Nat) -> (b : Bounds) -> Rule True YState
-  flowSeq mi b st (']' :: cs) _ = Succ0 (emit SeqEnd $ {pos $= incCol} st) cs
-  flowSeq mi b st []          _ = unclosed b "["
-  flowSeq mi b st cs sa@(SA r) =
-    case cand True mi st.pos cs sa of
+  flowSeq : TagEnv -> (mi : Nat) -> (b : Bounds) -> Rule True YState
+  flowSeq env mi b st (']' :: cs) _ = Succ0 (emit SeqEnd $ {pos $= incCol} st) cs
+  flowSeq env mi b st []          _ = unclosed b "["
+  flowSeq env mi b st cs sa@(SA r) =
+    case cand True mi env noProps st.pos cs sa of
       Fail0 e => Fail0 e
       Succ0 (pend, p1) r1 @{q1} =>
         let IL cnt r2 w := inlineWhite r1
@@ -290,30 +462,34 @@ mutual
                             Fail0 e => Fail0 e
                             Succ0 p4 r4 @{q4} =>
                               let 0 p4c := trans q4 pc
-                               in case flowVal mi (YS p4 evs1) r4 (r @{p4c}) of
+                               in case flowVal env mi (YS p4 evs1) r4 (r @{p4c}) of
                                     Fail0 e => Fail0 e
                                     Succ0 st5 r5 @{q5} =>
                                       let 0 p5c := trans q5 p4c
-                                       in succT (seqTail mi b (emit MapEnd st5) r5 (r @{p5c})) @{p5c}
+                                       in succT (seqTail env mi b (emit MapEnd st5) r5 (r @{p5c})) @{p5c}
                     _ => unclosed b "["
               else case pend of
                 PFlow d   =>
-                  succT (seqTail mi b (YS p2 (st.evs ++ d)) r2 (r @{pw})) @{pw}
-                PScalar Plain s =>
+                  succT (seqTail env mi b (YS p2 (st.evs ++ d)) r2 (r @{pw})) @{pw}
+                PAlias a  =>
+                  succT (seqTail env mi b (YS p2 (st.evs :< Alias a)) r2 (r @{pw})) @{pw}
+                PProps pr =>
+                  succT (seqTail env mi b (YS p2 (emptyScalarP pr st.evs)) r2 (r @{pw})) @{pw}
+                PScalar pr Plain s =>
                   case plainMore True mi s p2 r2 (r @{pw}) of
                     Fail0 e => Fail0 e
                     Succ0 (s2, p3) r3 @{q3} =>
                       let 0 pp := trans q3 pw
-                          st3  := YS p3 (st.evs :< Scalar Nothing NoTag Plain s2)
-                       in succT (seqTail mi b st3 r3 (r @{pp})) @{pp}
-                PScalar sty s =>
-                  let st2 := YS p2 (st.evs :< Scalar Nothing NoTag sty s)
-                   in succT (seqTail mi b st2 r2 (r @{pw})) @{pw}
+                          st3  := YS p3 (st.evs :< Scalar pr.anchor pr.tag Plain s2)
+                       in succT (seqTail env mi b st3 r3 (r @{pp})) @{pp}
+                PScalar pr sty s =>
+                  let st2 := YS p2 (st.evs :< Scalar pr.anchor pr.tag sty s)
+                   in succT (seqTail env mi b st2 r2 (r @{pw})) @{pw}
 
   ||| After a flow sequence entry: a comma and further entries, or the
   ||| closing bracket.
-  seqTail : (mi : Nat) -> (b : Bounds) -> Rule True YState
-  seqTail mi b st cs (SA r) = case flowSkip "[" b mi False st.pos cs of
+  seqTail : TagEnv -> (mi : Nat) -> (b : Bounds) -> Rule True YState
+  seqTail env mi b st cs (SA r) = case flowSkip "[" b mi False st.pos cs of
     Fail0 e => Fail0 e
     Succ0 p2 (']' :: r2) @{q2} =>
       Succ0 (YS (incCol p2) (st.evs :< SeqEnd)) r2 @{trans (uncons Same) q2}
@@ -322,32 +498,32 @@ mutual
         Fail0 e => Fail0 e
         Succ0 p3 r3 @{q3} =>
           let 0 pp := trans q3 (trans (uncons Same) q2)
-           in succT (flowSeq mi b (YS p3 st.evs) r3 (r @{pp})) @{pp}
+           in succT (flowSeq env mi b (YS p3 st.evs) r3 (r @{pp})) @{pp}
     Succ0 p2 [] => unclosed b "["
     Succ0 p2 (x :: _) =>
       parseFail (oneChar p2) (Expected ["','", "']'"] (pack [x]))
 
   ||| Inside a flow mapping [spec: c-flow-mapping], at a content
   ||| character: an entry or the closing brace.
-  flowMap : (mi : Nat) -> (b : Bounds) -> Rule True YState
-  flowMap mi b st ('}' :: cs) _ = Succ0 (emit MapEnd $ {pos $= incCol} st) cs
-  flowMap mi b st []          _ = unclosed b "{"
-  flowMap mi b st (c :: cs) sa@(SA r) =
+  flowMap : TagEnv -> (mi : Nat) -> (b : Bounds) -> Rule True YState
+  flowMap env mi b st ('}' :: cs) _ = Succ0 (emit MapEnd $ {pos $= incCol} st) cs
+  flowMap env mi b st []          _ = unclosed b "{"
+  flowMap env mi b st (c :: cs) sa@(SA r) =
     if c == ':' && not (plainSafeNext cs)
       then -- an entry with an empty key [spec: c-ns-flow-map-empty-key-entry]
         case flowSkip "{" b mi False (incCol st.pos) cs of
           Fail0 e => Fail0 e
           Succ0 p1 r1 @{q1} =>
             let 0 pp := trans q1 (uncons Same)
-             in case flowVal mi (YS p1 (emptyScalar st.evs)) r1 (r @{pp}) of
+             in case flowVal env mi (YS p1 (emptyScalar st.evs)) r1 (r @{pp}) of
                   Fail0 e => Fail0 e
                   Succ0 st2 r2 @{q2} => case flowSkip "{" b mi False st2.pos r2 of
                     Fail0 e => Fail0 e
                     Succ0 p3 r3 @{q3} =>
                       let 0 pp3 := trans (trans q3 (trans q2 q1)) (uncons Same)
-                       in succT (mapTail mi b (YS p3 st2.evs) r3 (r @{pp3})) @{pp3}
+                       in succT (mapTail env mi b (YS p3 st2.evs) r3 (r @{pp3})) @{pp3}
       else -- an entry starting with a key node
-        case flowNode True mi st (c :: cs) sa of
+        case flowNode True mi env noProps st (c :: cs) sa of
           Fail0 e => Fail0 e
           Succ0 st1 r1 @{q1} => case flowSkip "{" b mi False st1.pos r1 of
             Fail0 e => Fail0 e
@@ -356,69 +532,71 @@ mutual
                 Fail0 e => Fail0 e
                 Succ0 p3 r3 @{q3} =>
                   let 0 pp := trans q3 (trans (uncons Same) (trans q2 q1))
-                   in case flowVal mi (YS p3 st1.evs) r3 (r @{pp}) of
+                   in case flowVal env mi (YS p3 st1.evs) r3 (r @{pp}) of
                         Fail0 e => Fail0 e
                         Succ0 st4 r4 @{q4} =>
                           case flowSkip "{" b mi False st4.pos r4 of
                             Fail0 e => Fail0 e
                             Succ0 p5 r5 @{q5} =>
                               let 0 pp5 := trans q5 (trans q4 pp)
-                               in succT (mapTail mi b (YS p5 st4.evs) r5 (r @{pp5})) @{pp5}
+                               in succT (mapTail env mi b (YS p5 st4.evs) r5 (r @{pp5})) @{pp5}
             Succ0 p2 r2 @{q2} =>
               -- no colon: the value is empty [spec: ns-flow-map-yaml-key-entry]
               let 0 pp := trans q2 q1
-               in succT (mapTail mi b (YS p2 (emptyScalar st1.evs)) r2 (r @{pp})) @{pp}
+               in succT (mapTail env mi b (YS p2 (emptyScalar st1.evs)) r2 (r @{pp})) @{pp}
 
   ||| The value of a flow mapping entry or pair, after its `:`
   ||| indicator and any separation: empty if the entry ends here.
-  flowVal : (mi : Nat) -> Rule False YState
-  flowVal mi st []          _   = Succ0 ({evs $= emptyScalar} st) []
-  flowVal mi st (',' :: cs) _   = Succ0 ({evs $= emptyScalar} st) (',' :: cs)
-  flowVal mi st ('}' :: cs) _   = Succ0 ({evs $= emptyScalar} st) ('}' :: cs)
-  flowVal mi st (']' :: cs) _   = Succ0 ({evs $= emptyScalar} st) (']' :: cs)
-  flowVal mi st cs          acc = weaken $ flowNode True mi st cs acc
+  flowVal : TagEnv -> (mi : Nat) -> Rule False YState
+  flowVal env mi st []          _   = Succ0 ({evs $= emptyScalar} st) []
+  flowVal env mi st (',' :: cs) _   = Succ0 ({evs $= emptyScalar} st) (',' :: cs)
+  flowVal env mi st ('}' :: cs) _   = Succ0 ({evs $= emptyScalar} st) ('}' :: cs)
+  flowVal env mi st (']' :: cs) _   = Succ0 ({evs $= emptyScalar} st) (']' :: cs)
+  flowVal env mi st cs          acc = weaken $ flowNode True mi env noProps st cs acc
 
   ||| After a complete flow mapping entry: a comma followed by the next
   ||| entry, or the closing brace.
-  mapTail : (mi : Nat) -> (b : Bounds) -> Rule True YState
-  mapTail mi b st ('}' :: cs) _ = Succ0 (emit MapEnd $ {pos $= incCol} st) cs
-  mapTail mi b st (',' :: cs) (SA r) =
+  mapTail : TagEnv -> (mi : Nat) -> (b : Bounds) -> Rule True YState
+  mapTail env mi b st ('}' :: cs) _ = Succ0 (emit MapEnd $ {pos $= incCol} st) cs
+  mapTail env mi b st (',' :: cs) (SA r) =
     case flowSkip "{" b mi False (incCol st.pos) cs of
       Fail0 e => Fail0 e
       Succ0 p1 r1 @{q1} =>
         let 0 pp := trans q1 (uncons Same)
-         in succT (flowMap mi b (YS p1 st.evs) r1 (r @{pp})) @{pp}
-  mapTail mi b st []          _ = unclosed b "{"
-  mapTail mi b st (x :: _)    _ =
+         in succT (flowMap env mi b (YS p1 st.evs) r1 (r @{pp})) @{pp}
+  mapTail env mi b st []          _ = unclosed b "{"
+  mapTail env mi b st (x :: _)    _ =
     parseFail (oneChar st.pos) (Expected ["','", "'}'"] (pack [x]))
 
   ||| A block node [spec: s-l+block-node]: input at a content
-  ||| character, whose column defines the node's indentation.
-  blockNode : (mi : Nat) -> Rule True YState
-  blockNode mi st [] _ = eoi
-  blockNode mi st (c :: cs) sa@(SA r) =
+  ||| character, whose column defines the node's indentation. `oprops`
+  ||| are properties from a preceding line, belonging to a block
+  ||| collection found here (or merged into a scalar).
+  blockNode : (mi : Nat) -> TagEnv -> Props -> Rule True YState
+  blockNode mi env oprops st [] _ = eoi
+  blockNode mi env oprops st (c :: cs) sa@(SA r) =
     let n := st.pos.col
      in if c == '-' && wordEnd cs
-          then seqLoop n (emit (SeqStart False Nothing NoTag) st) (c :: cs) sa
+          then seqLoop env n (emit (SeqStart False oprops.anchor oprops.tag) st) (c :: cs) sa
         else if c == '?' && wordEnd cs
-          then case expEntry n (emit (MapStart False Nothing NoTag) st) (c :: cs) sa of
+          then case expEntry env n (emit (MapStart False oprops.anchor oprops.tag) st) (c :: cs) sa of
             Fail0 e => Fail0 e
-            Succ0 st1 r1 @{q1} => trans (blockMap n st1 r1 (r @{q1})) q1
+            Succ0 st1 r1 @{q1} => trans (blockMap env n st1 r1 (r @{q1})) q1
         else if c == ':' && wordEnd cs
           then
-            let evs1 := emptyScalar (st.evs :< MapStart False Nothing NoTag)
-             in case afterKey n (YS (incCol st.pos) evs1) cs (r @{uncons Same}) of
+            let evs1 := emptyScalar (st.evs :< MapStart False oprops.anchor oprops.tag)
+             in case afterKey env n noProps (YS (incCol st.pos) evs1) cs (r @{uncons Same}) of
                   Fail0 e => Fail0 e
                   Succ0 st1 r1 @{q1} =>
                     let 0 p1 := trans q1 (uncons Same)
-                     in trans (blockMap n st1 r1 (r @{p1})) p1
+                     in trans (blockMap env n st1 r1 (r @{p1})) p1
         else if c == '|' || c == '>'
           then case blockScalar (c == '>') mi (c :: cs) of
             Succ s rem @{prf} =>
               let sty := if c == '>' then Folded else Literal
-               in Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag sty s)) rem
+               in Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar oprops.anchor oprops.tag sty s)) rem
             Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
-        else case cand False mi st.pos (c :: cs) sa of
+        else case cand False mi env noProps st.pos (c :: cs) sa of
           Fail0 e => Fail0 e
           Succ0 (pend, p1) r1 @{q1} =>
             let IL cnt r2 w := inlineWhite r1
@@ -430,39 +608,74 @@ mutual
                       then custom (BS st.pos p1) InvalidKey
                       else case r2 of
                         ':' :: r3 =>
-                          let evs1 := flushPend (st.evs :< MapStart False Nothing NoTag) pend
+                          let evs1 := flushPend (st.evs :< MapStart False oprops.anchor oprops.tag) pend
                               0 pc := trans (uncons Same) (trans w q1)
-                           in case afterKey n (YS (incCol p2) evs1) r3 (r @{pc}) of
+                           in case afterKey env n noProps (YS (incCol p2) evs1) r3 (r @{pc}) of
                                 Fail0 e => Fail0 e
                                 Succ0 st4 r4 @{q4} =>
                                   let 0 p4 := trans q4 pc
-                                   in trans (blockMap n st4 r4 (r @{p4})) p4
+                                   in trans (blockMap env n st4 r4 (r @{p4})) p4
                         _ => eoi
                   else case pend of
-                    PFlow d => case lineEnd (cnt > 0) p2 r2 of
-                      Fail0 e => Fail0 e
-                      Succ0 p3 r3 @{q3} =>
-                        Succ0 (YS p3 (st.evs ++ d)) r3 @{trans q3 pw}
-                    PScalar Plain s => case plainMore False mi s p2 r2 (r @{pw}) of
-                      Fail0 e => Fail0 e
-                      Succ0 (s2, p3) r3 @{q3} =>
-                        if colonBlock r3
-                          then custom (BS st.pos p3) InvalidKey
-                          else
-                            Succ0 (YS p3 (st.evs :< Scalar Nothing NoTag Plain s2)) r3
-                              @{trans q3 pw}
-                    PScalar sty s => case lineEnd (cnt > 0) p2 r2 of
-                      Fail0 e => Fail0 e
-                      Succ0 p3 r3 @{q3} =>
-                        Succ0 (YS p3 (st.evs :< Scalar Nothing NoTag sty s)) r3
-                          @{trans q3 pw}
+                    PFlow d => case patchFlow oprops d of
+                      Left e   => custom (BS st.pos p1) e
+                      Right d2 => case lineEnd (cnt > 0) p2 r2 of
+                        Fail0 e => Fail0 e
+                        Succ0 p3 r3 @{q3} =>
+                          Succ0 (YS p3 (st.evs ++ d2)) r3 @{trans q3 pw}
+                    PAlias a =>
+                      if isNoProps oprops
+                        then case lineEnd (cnt > 0) p2 r2 of
+                          Fail0 e => Fail0 e
+                          Succ0 p3 r3 @{q3} =>
+                            Succ0 (YS p3 (st.evs :< Alias a)) r3 @{trans q3 pw}
+                        else parseFail (oneChar st.pos) (Unknown "properties on alias node")
+                    PProps pr => case mergeProps oprops pr of
+                      Left e    => custom (BS st.pos p1) e
+                      Right prm => case bsStart r2 of
+                        Just f => case blockScalar f mi r2 of
+                          Succ s rem @{prf} =>
+                            let sty := if f then Folded else Literal
+                             in Succ0 (YS (endPos p2 prf) (st.evs :< Scalar prm.anchor prm.tag sty s)) rem
+                              @{trans prf pw}
+                          Fail start errEnd err => Fail0 (boundedErr p2 start errEnd err)
+                        Nothing =>
+                          if breakStart r2
+                            then case skipToContent r2 of
+                              SR (L ind LContent) r3 prf3 =>
+                                if ind >= mi
+                                  then
+                                    let 0 p3 := trans prf3 pw
+                                     in succT (blockNode mi env prm (YS (endPos p2 prf3) st.evs) r3 (r @{p3})) @{p3}
+                                  else Succ0 (YS p2 (emptyScalarP prm st.evs)) r2 @{pw}
+                              SR _ _ _ => Succ0 (YS p2 (emptyScalarP prm st.evs)) r2 @{pw}
+                            else if null r2
+                              then Succ0 (YS p2 (emptyScalarP prm st.evs)) r2 @{pw}
+                              else parseFail (oneChar p2) (Unknown "content after node properties")
+                    PScalar pr Plain s => case mergeProps oprops pr of
+                      Left e    => custom (BS st.pos p1) e
+                      Right prm => case plainMore False mi s p2 r2 (r @{pw}) of
+                        Fail0 e => Fail0 e
+                        Succ0 (s2, p3) r3 @{q3} =>
+                          if colonBlock r3
+                            then custom (BS st.pos p3) InvalidKey
+                            else
+                              Succ0 (YS p3 (st.evs :< Scalar prm.anchor prm.tag Plain s2)) r3
+                                @{trans q3 pw}
+                    PScalar pr sty s => case mergeProps oprops pr of
+                      Left e    => custom (BS st.pos p1) e
+                      Right prm => case lineEnd (cnt > 0) p2 r2 of
+                        Fail0 e => Fail0 e
+                        Succ0 p3 r3 @{q3} =>
+                          Succ0 (YS p3 (st.evs :< Scalar prm.anchor prm.tag sty s)) r3
+                            @{trans q3 pw}
 
   ||| Entries of a block sequence anchored at column `n` [spec:
   ||| l+block-sequence], starting at a `- ` indicator. Emits the SeqEnd
   ||| when the indentation ends.
-  seqLoop : (n : Nat) -> Rule True YState
-  seqLoop n st ('-' :: cs) (SA r) =
-    case seqEntry n (YS (incCol st.pos) st.evs) cs (r @{uncons Same}) of
+  seqLoop : TagEnv -> (n : Nat) -> Rule True YState
+  seqLoop env n st ('-' :: cs) (SA r) =
+    case seqEntry env n (YS (incCol st.pos) st.evs) cs (r @{uncons Same}) of
       Fail0 e => Fail0 e
       Succ0 st1 r1 @{q1} =>
         let 0 p1 := trans q1 (uncons Same)
@@ -471,17 +684,17 @@ mutual
                 if ind == n && dashNext r2
                   then
                     let 0 pp := trans prf2 p1
-                     in succT (seqLoop n (YS (endPos st1.pos prf2) st1.evs) r2 (r @{pp})) @{pp}
+                     in succT (seqLoop env n (YS (endPos st1.pos prf2) st1.evs) r2 (r @{pp})) @{pp}
                   else Succ0 (emit SeqEnd st1) r1 @{p1}
               SR _ _ _ => Succ0 (emit SeqEnd st1) r1 @{p1}
-  seqLoop n st (x :: _) _ = parseFail (oneChar st.pos) (Expected ["'-'"] (pack [x]))
-  seqLoop n st []       _ = eoi
+  seqLoop env n st (x :: _) _ = parseFail (oneChar st.pos) (Expected ["'-'"] (pack [x]))
+  seqLoop env n st []       _ = eoi
 
   ||| A block sequence entry after its `- ` indicator [spec:
   ||| c-l-block-seq-entry]: same-line content (including compact
   ||| collections), a more indented node on following lines, or empty.
-  seqEntry : (n : Nat) -> Rule False YState
-  seqEntry n st cs sa@(SA r) =
+  seqEntry : TagEnv -> (n : Nat) -> Rule False YState
+  seqEntry env n st cs sa@(SA r) =
     let IL cnt r2 w := inlineWhite cs
         p2 := addCol cnt st.pos
      in case r2 of
@@ -494,54 +707,54 @@ mutual
                     then
                       let st3 := YS (endPos p2 prf3) st.evs
                        in case trans prf3 w of
-                            Same     => weaken $ blockNode (S n) st3 r3 sa
+                            Same     => weaken $ blockNode (S n) env noProps st3 r3 sa
                             Uncons u =>
-                              weaken $ trans (blockNode (S n) st3 r3 (r @{uncons u}))
+                              weaken $ trans (blockNode (S n) env noProps st3 r3 (r @{uncons u}))
                                              (weaken (uncons u))
                     else Succ0 (YS p2 (emptyScalar st.evs)) (x :: xs) @{w}
                 SR _ _ _ => Succ0 (YS p2 (emptyScalar st.evs)) (x :: xs) @{w}
               else
                 let st2 := YS p2 st.evs
                  in case w of
-                      Same     => weaken $ blockNode (S n) st2 (x :: xs) sa
+                      Same     => weaken $ blockNode (S n) env noProps st2 (x :: xs) sa
                       Uncons u =>
-                        weaken $ trans (blockNode (S n) st2 (x :: xs) (r @{uncons u}))
+                        weaken $ trans (blockNode (S n) env noProps st2 (x :: xs) (r @{uncons u}))
                                        (weaken (uncons u))
 
   ||| Further entries of a block mapping anchored at column `n` [spec:
   ||| l+block-mapping]: emits the MapEnd when the indentation ends.
-  blockMap : (n : Nat) -> Rule False YState
-  blockMap n st cs sa@(SA r) = case skipToContent cs of
+  blockMap : TagEnv -> (n : Nat) -> Rule False YState
+  blockMap env n st cs sa@(SA r) = case skipToContent cs of
     SR (L ind LContent) r2 prf2 =>
       if ind == n
         then
           let st2 := YS (endPos st.pos prf2) st.evs
            in case prf2 of
-                Same => case mapEntry n st2 r2 sa of
+                Same => case mapEntry env n st2 r2 sa of
                   Fail0 e => Fail0 e
                   Succ0 st3 r3 @{q3} =>
-                    trans (blockMap n st3 r3 (r @{q3})) (weaken q3)
-                Uncons u => case mapEntry n st2 r2 (r @{uncons u}) of
+                    trans (blockMap env n st3 r3 (r @{q3})) (weaken q3)
+                Uncons u => case mapEntry env n st2 r2 (r @{uncons u}) of
                   Fail0 e => Fail0 e
                   Succ0 st3 r3 @{q3} =>
                     let 0 p3 := trans q3 (uncons u)
-                     in trans (blockMap n st3 r3 (r @{p3})) (weaken p3)
+                     in trans (blockMap env n st3 r3 (r @{p3})) (weaken p3)
         else Succ0 (emit MapEnd st) cs
     SR _ _ _ => Succ0 (emit MapEnd st) cs
 
   ||| A single block mapping entry at indent `n` [spec:
   ||| ns-l-block-map-entry]: explicit (`? `), an empty key (`: `), or
   ||| an implicit single-line key followed by `:`.
-  mapEntry : (n : Nat) -> Rule True YState
-  mapEntry n st [] _ = eoi
-  mapEntry n st (c :: cs) sa@(SA r) =
+  mapEntry : TagEnv -> (n : Nat) -> Rule True YState
+  mapEntry env n st [] _ = eoi
+  mapEntry env n st (c :: cs) sa@(SA r) =
     if c == '?' && wordEnd cs
-      then expEntry n st (c :: cs) sa
+      then expEntry env n st (c :: cs) sa
     else if c == ':' && wordEnd cs
-      then case afterKey n (YS (incCol st.pos) (emptyScalar st.evs)) cs (r @{uncons Same}) of
+      then case afterKey env n noProps (YS (incCol st.pos) (emptyScalar st.evs)) cs (r @{uncons Same}) of
         Fail0 e => Fail0 e
         Succ0 st1 r1 @{q1} => Succ0 st1 r1 @{trans q1 (uncons Same)}
-    else case cand False (S n) st.pos (c :: cs) sa of
+    else case cand False (S n) env noProps st.pos (c :: cs) sa of
       Fail0 e => Fail0 e
       Succ0 (pend, p1) r1 @{q1} =>
         let IL cnt r2 w := inlineWhite r1
@@ -554,7 +767,7 @@ mutual
                   else case r2 of
                     ':' :: r3 =>
                       let 0 pc := trans (uncons Same) (trans w q1)
-                       in case afterKey n (YS (incCol p2) (flushPend st.evs pend)) r3 (r @{pc}) of
+                       in case afterKey env n noProps (YS (incCol p2) (flushPend st.evs pend)) r3 (r @{pc}) of
                             Fail0 e => Fail0 e
                             Succ0 st4 r4 @{q4} => Succ0 st4 r4 @{trans q4 pc}
                     _ => eoi
@@ -566,8 +779,8 @@ mutual
   ||| c-l-block-map-explicit-entry], starting at its `?` indicator at
   ||| indent `n`: a block node as key, then optionally a `:` line at
   ||| the same indent with the value.
-  expEntry : (n : Nat) -> Rule True YState
-  expEntry n st ('?' :: cs) sa@(SA r) =
+  expEntry : TagEnv -> (n : Nat) -> Rule True YState
+  expEntry env n st ('?' :: cs) sa@(SA r) =
     let IL cnt r2 w := inlineWhite cs
         p2 := addCol cnt (incCol st.pos)
         keyRes : Result0 True Char ('?' :: cs) (BoundedErr YErr) YState :=
@@ -580,12 +793,12 @@ mutual
                     if ind >= S n
                       then
                         let 0 p3 := trans prf3 (trans w (uncons Same))
-                         in succT (blockNode (S n) (YS (endPos p2 prf3) st.evs) r3 (r @{p3})) @{p3}
+                         in succT (blockNode (S n) env noProps (YS (endPos p2 prf3) st.evs) r3 (r @{p3})) @{p3}
                       else Succ0 (YS p2 (emptyScalar st.evs)) (x :: xs) @{trans w (uncons Same)}
                   SR _ _ _ => Succ0 (YS p2 (emptyScalar st.evs)) (x :: xs) @{trans w (uncons Same)}
                 else
                   let 0 pw := trans w (uncons Same)
-                   in succT (blockNode (S n) (YS p2 st.evs) (x :: xs) (r @{pw})) @{pw}
+                   in succT (blockNode (S n) env noProps (YS p2 st.evs) (x :: xs) (r @{pw})) @{pw}
      in case keyRes of
           Fail0 e => Fail0 e
           Succ0 stK remK @{qK} => case skipToContent remK of
@@ -595,59 +808,71 @@ mutual
                   ':' :: rV2 =>
                     let pV   := incCol (endPos stK.pos prfV)
                         0 pc := trans (uncons Same) (trans prfV qK)
-                     in case afterKey n (YS pV stK.evs) rV2 (r @{pc}) of
+                     in case afterKey env n noProps (YS pV stK.evs) rV2 (r @{pc}) of
                           Fail0 e => Fail0 e
                           Succ0 stF rF @{qF} => Succ0 stF rF @{trans qF pc}
                   _ => eoi
                 else Succ0 ({evs $= emptyScalar} stK) remK @{qK}
             SR _ _ _ => Succ0 ({evs $= emptyScalar} stK) remK @{qK}
-  expEntry n st (x :: _) _ = parseFail (oneChar st.pos) (Expected ["'?'"] (pack [x]))
-  expEntry n st []       _ = eoi
+  expEntry env n st (x :: _) _ = parseFail (oneChar st.pos) (Expected ["'?'"] (pack [x]))
+  expEntry env n st []       _ = eoi
 
   ||| The value of a block mapping entry, after its `:` indicator
   ||| [spec: c-l-block-map-implicit-value]: an inline value on the same
   ||| line, a block node on following lines, a sequence at the same
-  ||| indent (the "seq-spaces" exception), or empty.
-  afterKey : (n : Nat) -> Rule False YState
-  afterKey n st cs sa@(SA r) =
+  ||| indent (the "seq-spaces" exception), or empty. `pr` holds
+  ||| properties already parsed on the indicator's line.
+  afterKey : TagEnv -> (n : Nat) -> Props -> Rule False YState
+  afterKey env n pr st cs sa@(SA r) =
     let IL cnt r2 w := inlineWhite cs
         p2 := addCol cnt st.pos
      in case r2 of
-          [] => Succ0 (YS p2 (emptyScalar st.evs)) [] @{w}
+          [] => Succ0 (YS p2 (emptyScalarP pr st.evs)) [] @{w}
           x :: xs =>
-            if isBreak x || x == '#'
+            if x == '&' || x == '!'
+              then case w of
+                Same     => case pProps env pr p2 (x :: xs) sa of
+                  Fail0 e => Fail0 e
+                  Succ0 (pr2, p3) r3 @{q3} =>
+                    trans (afterKey env n pr2 (YS p3 st.evs) r3 (r @{q3})) (weaken q3)
+                Uncons u => case pProps env pr p2 (x :: xs) (r @{uncons u}) of
+                  Fail0 e => Fail0 e
+                  Succ0 (pr2, p3) r3 @{q3} =>
+                    let 0 pc := trans q3 (uncons u)
+                     in trans (afterKey env n pr2 (YS p3 st.evs) r3 (r @{pc})) (weaken pc)
+            else if isBreak x || x == '#'
               then case skipToContent (x :: xs) of
                 SR (L ind LContent) r3 prf3 =>
                   let st3 := YS (endPos p2 prf3) st.evs
                    in if ind >= S n
                         then case trans prf3 w of
-                          Same     => weaken $ blockNode (S n) st3 r3 sa
+                          Same     => weaken $ blockNode (S n) env pr st3 r3 sa
                           Uncons u =>
-                            weaken $ trans (blockNode (S n) st3 r3 (r @{uncons u}))
+                            weaken $ trans (blockNode (S n) env pr st3 r3 (r @{uncons u}))
                                            (weaken (uncons u))
                         else if ind == n && dashNext r3
                           then
-                            let st3s := emit (SeqStart False Nothing NoTag) st3
+                            let st3s := emit (SeqStart False pr.anchor pr.tag) st3
                              in case trans prf3 w of
-                                  Same     => weaken $ seqLoop n st3s r3 sa
+                                  Same     => weaken $ seqLoop env n st3s r3 sa
                                   Uncons u =>
-                                    weaken $ trans (seqLoop n st3s r3 (r @{uncons u}))
+                                    weaken $ trans (seqLoop env n st3s r3 (r @{uncons u}))
                                                    (weaken (uncons u))
-                          else Succ0 (YS p2 (emptyScalar st.evs)) (x :: xs) @{w}
-                SR _ _ _ => Succ0 (YS p2 (emptyScalar st.evs)) (x :: xs) @{w}
+                          else Succ0 (YS p2 (emptyScalarP pr st.evs)) (x :: xs) @{w}
+                SR _ _ _ => Succ0 (YS p2 (emptyScalarP pr st.evs)) (x :: xs) @{w}
               else case w of
-                Same     => weaken $ inlineVal n (YS p2 st.evs) (x :: xs) sa
+                Same     => weaken $ inlineVal env n pr (YS p2 st.evs) (x :: xs) sa
                 Uncons u =>
-                  weaken $ trans (inlineVal n (YS p2 st.evs) (x :: xs) (r @{uncons u}))
+                  weaken $ trans (inlineVal env n pr (YS p2 st.evs) (x :: xs) (r @{uncons u}))
                                  (weaken (uncons u))
 
   ||| A mapping value on the same line as its `:` indicator: a flow
   ||| node or a block scalar [spec: s-l+flow-in-block, s-l+block-scalar].
-  inlineVal : (n : Nat) -> Rule True YState
-  inlineVal n st [] _ = eoi
-  inlineVal n st (c :: cs) sa@(SA r) =
-    if c == '[' || c == '{' || c == '\'' || c == '"'
-      then case flowNode False (S n) st (c :: cs) sa of
+  inlineVal : TagEnv -> (n : Nat) -> Props -> Rule True YState
+  inlineVal env n pr st [] _ = eoi
+  inlineVal env n pr st (c :: cs) sa@(SA r) =
+    if c == '[' || c == '{' || c == '\'' || c == '"' || c == '*'
+      then case flowNode False (S n) env pr st (c :: cs) sa of
         Fail0 e => Fail0 e
         Succ0 st1 r1 @{q1} => case lineEnd False st1.pos r1 of
           Fail0 e => Fail0 e
@@ -656,7 +881,7 @@ mutual
         then case blockScalar (c == '>') (S n) (c :: cs) of
           Succ s rem @{prf} =>
             let sty := if c == '>' then Folded else Literal
-             in Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar Nothing NoTag sty s)) rem
+             in Succ0 (YS (endPos st.pos prf) (st.evs :< Scalar pr.anchor pr.tag sty s)) rem
           Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
       else if isPlainFirst False c cs
         then case plainSegment False (c :: cs) of
@@ -667,7 +892,7 @@ mutual
                 if colonBlock r2
                   then custom (BS st.pos p2) InvalidKey
                   else
-                    Succ0 (YS p2 (st.evs :< Scalar Nothing NoTag Plain s2)) r2
+                    Succ0 (YS p2 (st.evs :< Scalar pr.anchor pr.tag Plain s2)) r2
                       @{trans q2 prf}
           Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
         else parseFail (oneChar st.pos) (Unknown $ pack [c])
@@ -676,57 +901,149 @@ mutual
 --          Documents
 --------------------------------------------------------------------------------
 
--- Blank and comment lines after a document's root node: only the end
--- of input may follow (single-document subset).
-docLines : Position -> (cs : List Char) -> Result0 False Char cs (BoundedErr YErr) Position
-docLines pos cs = case skipToContent cs of
-  SR (L _ LEnd) rem prf => Succ0 (endPos pos prf) rem @{prf}
-  SR (L _ _)    rem prf => custom (oneChar $ endPos pos prf) TrailingContent
+mutual
+  ||| The documents of a YAML stream [spec: l-yaml-stream]. `ab` is
+  ||| true where a document may start without an explicit `---` marker:
+  ||| at the start of the stream and after a `...` marker.
+  stream : (ab : Bool) -> TagEnv -> (sawYaml : Bool) -> Rule False YState
+  stream ab env sy st cs sa@(SA r) = case skipToContent cs of
+    SR (L _ LEnd) rem prf =>
+      if dirty
+        then parseFail (oneChar $ endPos st.pos prf) (Expected ["'---'"] "end of input")
+        else Succ0 ({pos := endPos st.pos prf} st) rem @{prf}
+    SR (L _ LDocEnd) rem prf =>
+      parseFail (oneChar $ endPos st.pos prf) (Unknown "'...'")
+    SR (L _ LDocStart) rem prf =>
+      let st1 := emit (DocStart True) ({pos := endPos st.pos prf} st)
+       in case prf of
+            Same     => weaken $ docStart env st1 cs sa
+            Uncons u =>
+              weaken $ trans (docStart env st1 rem (r @{uncons u})) (weaken (uncons u))
+    SR (L ind LContent) rem prf =>
+      let pC  := endPos st.pos prf
+          st1 := {pos := pC} st
+       in if bomStart rem && ind == 0
+            then case prf of
+              Same     => weaken $ bomDoc ab env sy st1 cs sa
+              Uncons u =>
+                weaken $ trans (bomDoc ab env sy st1 rem (r @{uncons u})) (weaken (uncons u))
+          else if dirStart rem && ind == 0
+            then
+              if ab || dirty
+                then case prf of
+                  Same     => weaken $ dirDoc ab env sy st1 cs sa
+                  Uncons u =>
+                    weaken $ trans (dirDoc ab env sy st1 rem (r @{uncons u})) (weaken (uncons u))
+                else custom (oneChar pC) TrailingContent
+          else if ab && not dirty
+            then
+              let st2 := emit (DocStart False) st1
+               in case prf of
+                    Same     => weaken $ bareDoc env st2 cs sa
+                    Uncons u =>
+                      weaken $ trans (bareDoc env st2 rem (r @{uncons u})) (weaken (uncons u))
+            else custom (oneChar pC) TrailingContent
 
--- A comment after a document's root node.
-docComment : Position -> (cs : List Char) -> Result0 False Char cs (BoundedErr YErr) Position
-docComment pos (c :: cs) =
-  if isBreak c
-    then succF $ docLines (incLine pos) cs
-    else succF $ docComment (incCol pos) cs
-docComment pos [] = Succ0 pos []
+    where
+      dirty : Bool
+      dirty = sy || not (null env.handles)
 
-||| Consumes trailing white space and comments after a document's root
-||| node, succeeding only if the end of input follows.
-trailer : (sw : Bool) -> Position -> (cs : List Char) -> Result0 False Char cs (BoundedErr YErr) Position
-trailer sw pos (c :: cs) =
-  if isWhite c then succF $ trailer True (incCol pos) cs
-  else if isBreak c then succF $ docLines (incLine pos) cs
-  else if c == '#' && sw then succF $ docComment (incCol pos) cs
-  else custom (oneChar pos) TrailingContent
-trailer _ pos [] = Succ0 pos []
+      bomStart : List Char -> Bool
+      bomStart ('\xfeff' :: _) = True
+      bomStart _               = False
 
-||| A single document: leading blank and comment lines, an optional
-||| root node, trailing blank and comment lines.
-doc : Rule False YState
-doc st cs sa@(SA r) = case skipToContent cs of
-  SR (L _ LEnd)     rem prf => Succ0 ({pos := endPos st.pos prf} st) rem @{prf}
-  SR (L _ LContent) rem prf =>
-    let st1 := YS (endPos st.pos prf) (st.evs :< DocStart False)
-     in case prf of
-          Same     => content st1 cs sa
-          Uncons u => trans (content st1 rem (r @{uncons u})) (weaken $ uncons u)
-  SR (L _ _)        rem prf =>
-    parseFail (oneChar $ endPos st.pos prf) (Unknown "document marker")
+      dirStart : List Char -> Bool
+      dirStart ('%' :: _) = True
+      dirStart _          = False
 
-  where
-    content :
-         YState
-      -> (rem : List Char)
-      -> (0 acc : SuffixAcc rem)
-      -> Result0 False Char rem (BoundedErr YErr) YState
-    content st1 rem acc = case blockNode 0 st1 rem acc of
-      Fail0 e => Fail0 e
-      Succ0 st2 r2 @{q} =>
-        case trailer False st2.pos r2 of
+  ||| A byte order mark before a document [spec: l-document-prefix].
+  bomDoc : (ab : Bool) -> TagEnv -> (sawYaml : Bool) -> Rule True YState
+  bomDoc ab env sy st ('\xfeff' :: t) (SA r) =
+    succT (stream ab env sy ({pos $= incCol} st) t (r @{uncons Same})) @{uncons Same}
+  bomDoc _ _ _ st _ _ = eoi
+
+  ||| A directive line before a document [spec: l-directive].
+  dirDoc : (ab : Bool) -> TagEnv -> (sawYaml : Bool) -> Rule True YState
+  dirDoc ab env sy st cs (SA r) = case dirLine cs of
+    Succ ln rem @{prf} =>
+      let pos2 := endPos st.pos prf
+       in case parseDirective env sy ln of
+            Left e             => custom (BS st.pos pos2) e
+            Right (env2, sy2)  =>
+              succT (stream ab env2 sy2 (YS pos2 st.evs) rem (r @{prf})) @{prf}
+    Fail start errEnd err => Fail0 (boundedErr st.pos start errEnd err)
+
+  ||| An explicit document, at its `---` marker (the DocStart event has
+  ||| already been emitted).
+  docStart : TagEnv -> Rule True YState
+  docStart env st ('-' :: '-' :: '-' :: t) (SA r) =
+    let IL cnt r2 w := inlineWhite t
+        p2 := addCol cnt (addCol 3 st.pos)
+     in case r2 of
+          [] =>
+            Succ0 (YS p2 (emptyScalar st.evs)) []
+              @{trans w (uncons $ uncons $ uncons Same)}
+          x :: xs =>
+            if isBreak x || x == '#'
+              then case skipToContent (x :: xs) of
+                SR (L ind LContent) r3 prf3 =>
+                  let 0 pc := trans prf3 (trans w (uncons $ uncons $ uncons Same))
+                   in case blockNode 0 env noProps (YS (endPos p2 prf3) st.evs) r3 (r @{pc}) of
+                        Fail0 e => Fail0 e
+                        Succ0 st4 r4 @{q4} =>
+                          let 0 p4 := trans q4 pc
+                           in trans (docTail st4 r4 (r @{p4})) p4
+                SR _ _ _ =>
+                  -- an empty document; docTail handles what follows
+                  let 0 p3 := trans w (uncons $ uncons $ uncons Same)
+                   in trans (docTail (YS p2 (emptyScalar st.evs)) (x :: xs) (r @{p3})) p3
+              else
+                let 0 p3 := trans w (uncons $ uncons $ uncons Same)
+                 in case blockNode 0 env noProps (YS p2 st.evs) (x :: xs) (r @{p3}) of
+                      Fail0 e => Fail0 e
+                      Succ0 st4 r4 @{q4} =>
+                        let 0 p4 := trans q4 p3
+                         in trans (docTail st4 r4 (r @{p4})) p4
+  docStart env st _ _ = eoi
+
+  ||| A document starting without a `---` marker (the DocStart event
+  ||| has already been emitted).
+  bareDoc : TagEnv -> Rule True YState
+  bareDoc env st cs sa@(SA r) = case blockNode 0 env noProps st cs sa of
+    Fail0 e => Fail0 e
+    Succ0 st1 r1 @{q1} => trans (docTail st1 r1 (r @{q1})) q1
+
+  ||| After a document's root node: an explicit `...` end, the start of
+  ||| the next document, the end of the stream, or an error.
+  docTail : Rule False YState
+  docTail st cs sa@(SA r) = case skipToContent cs of
+    SR (L _ LEnd) rem prf =>
+      Succ0 (YS (endPos st.pos prf) (st.evs :< DocEnd False)) rem @{prf}
+    SR (L _ LDocStart) rem prf =>
+      let st1 := emit (DocEnd False) ({pos := endPos st.pos prf} st)
+       in case prf of
+            Same     => stream False defaultEnv False st1 cs sa
+            Uncons u =>
+              trans (stream False defaultEnv False st1 rem (r @{uncons u})) (weaken (uncons u))
+    SR (L _ LDocEnd) rem prf =>
+      let st1 := YS (endPos st.pos prf) st.evs
+       in case prf of
+            Same     => weaken $ docSuffix st1 cs sa
+            Uncons u =>
+              weaken $ trans (docSuffix st1 rem (r @{uncons u})) (weaken (uncons u))
+    SR (L _ LContent) rem prf =>
+      custom (oneChar $ endPos st.pos prf) TrailingContent
+
+  ||| A `...` document end marker [spec: l-document-suffix].
+  docSuffix : Rule True YState
+  docSuffix st ('.' :: '.' :: '.' :: t) (SA r) =
+    let st1 := YS (addCol 3 st.pos) (st.evs :< DocEnd True)
+     in case lineEnd False st1.pos t of
           Fail0 e => Fail0 e
-          Succ0 p3 r3 @{q3} =>
-            Succ0 (YS p3 (st2.evs :< DocEnd False)) r3 @{weaken $ trans q3 q}
+          Succ0 p2 r2 @{q2} =>
+            let 0 pp := trans q2 (uncons $ uncons $ uncons Same)
+             in succT (stream True defaultEnv False (YS p2 st1.evs) r2 (r @{pp})) @{pp}
+  docSuffix st _ _ = eoi
 
 --------------------------------------------------------------------------------
 --          Entry Point
@@ -743,12 +1060,7 @@ normalize []                   = []
 export
 parseEvents : Origin -> String -> Either (ParseError YErr) (List Event)
 parseEvents o str =
-  let cs := normalize (stripBom $ unpack str)
-   in case doc (YS begin [<StreamStart]) cs suffixAcc of
+  let cs := normalize (unpack str)
+   in case stream True defaultEnv False (YS begin [<StreamStart]) cs suffixAcc of
         Succ0 st _ => Right (st.evs <>> [StreamEnd])
         Fail0 err  => Left (toParseError o (pack cs) err)
-
-  where
-    stripBom : List Char -> List Char
-    stripBom ('\xfeff' :: cs) = cs
-    stripBom cs               = cs
