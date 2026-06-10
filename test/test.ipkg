@@ -1,0 +1,10 @@
+package parser-yaml-test
+version = 0.1.0
+authors = "mitchmindtree"
+
+depends = parser-yaml
+        , hedgehog
+
+main = Main
+executable = "parser-yaml-test"
+sourcedir = "src"
