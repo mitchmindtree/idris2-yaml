@@ -74,6 +74,13 @@ isPlainFirst inFlow c   _        =
 --          Line Structure
 --------------------------------------------------------------------------------
 
+||| Does a token like `-`, `?` or `:` end here, that is, is it followed
+||| by white space, a line break, or the end of input?
+public export
+wordEnd : List Char -> Bool
+wordEnd []       = True
+wordEnd (c :: _) = isWhite c || isBreak c
+
 ||| Classification of the next content found by `skipToContent`.
 public export
 data LineKind : Type where
@@ -119,10 +126,6 @@ skipToContent : (cs : List Char) -> SkipRes cs
 skipToContent cs = line cs Same
 
   where
-    wordEnd : List Char -> Bool
-    wordEnd []       = True
-    wordEnd (c :: _) = isWhite c || isBreak c
-
     mutual
       -- at the start of a line
       line : (rem : List Char) -> Suffix False rem cs -> SkipRes cs
@@ -157,9 +160,91 @@ skipToContent cs = line cs Same
       comment (_    :: t) p = comment t (Uncons p)
       comment []          p = SR (L 0 LEnd) [] p
 
+||| Result of `inlineWhite`: a count of skipped white space characters,
+||| the remaining input, and a proof relating it to the original input.
+public export
+record Inl (cs : List Char) where
+  constructor IL
+  count : Nat
+  rem   : List Char
+  prf   : Suffix False rem cs
+
+||| Consumes white space within a line.
+export
+inlineWhite : (cs : List Char) -> Inl cs
+inlineWhite cs = go 0 cs Same
+
+  where
+    go : Nat -> (rem : List Char) -> Suffix False rem cs -> Inl cs
+    go n (' '  :: t) p = go (S n) t (Uncons p)
+    go n ('\t' :: t) p = go (S n) t (Uncons p)
+    go n rem         p = IL n rem p
+
 --------------------------------------------------------------------------------
 --          Plain Scalars
 --------------------------------------------------------------------------------
+
+||| Continuation of a plain scalar onto the next line (see `plainCont`).
+public export
+data Cont : (cs : List Char) -> Type where
+  ||| The scalar ends here: nothing is consumed.
+  Stop : Cont cs
+
+  ||| The scalar continues at `rem`, with `blanks` empty lines between
+  ||| the segments (zero empty lines fold into a single space).
+  More : (blanks : Nat) -> (rem : List Char) -> Suffix True rem cs -> Cont cs
+
+||| From the end of a plain-scalar segment (at its trailing white space
+||| or line break): does the scalar continue on a following line
+||| [spec: s-flow-folded]?
+|||
+||| Stops at comment lines, document markers, lines indented less than
+||| `mi`, and lines starting with a character that cannot continue a
+||| plain scalar. This must mirror the stop conditions of
+||| `plainSegment`'s lookahead.
+export
+plainCont : (inFlow : Bool) -> (mi : Nat) -> (cs : List Char) -> Cont cs
+plainCont inFlow mi cs = pre cs Same
+
+  where
+    isMarker : List Char -> Bool
+    isMarker ('-' :: '-' :: '-' :: t) = wordEnd t
+    isMarker ('.' :: '.' :: '.' :: t) = wordEnd t
+    isMarker _                        = False
+
+    -- may a continuation line start with this content [spec:
+    -- ns-plain-char]?
+    contFirst : Char -> List Char -> Bool
+    contFirst '#' _        = False
+    contFirst ':' (n :: _) = isPlainSafe inFlow n
+    contFirst ':' []       = False
+    contFirst c   _        = not (inFlow && isFlowInd c)
+
+    mutual
+      -- at the start of a line (the first break already consumed)
+      line : Nat -> (rem : List Char) -> Suffix True rem cs -> Cont cs
+      line k rem p = if isMarker rem then Stop else indent k 0 rem p
+
+      -- counting indentation spaces
+      indent : Nat -> Nat -> (rem : List Char) -> Suffix True rem cs -> Cont cs
+      indent k n (' ' :: t) p = indent k (S n) t (Uncons p)
+      indent k n rem        p = white k n rem p
+
+      -- separation white space beyond the indentation
+      white : Nat -> Nat -> (rem : List Char) -> Suffix True rem cs -> Cont cs
+      white k n ('\t' :: t) p = white k n t (Uncons p)
+      white k n (' '  :: t) p = white k n t (Uncons p)
+      white k n ('\n' :: t) p = line (S k) t (Uncons p)
+      white k n []          p = Stop
+      white k n (c :: t)    p =
+        if n >= mi && contFirst c t then More k (c :: t) p else Stop
+
+    -- white space before the first line break
+    pre : (rem : List Char) -> Suffix False rem cs -> Cont cs
+    pre (' '  :: t) p = pre t (Uncons p)
+    pre ('\t' :: t) p = pre t (Uncons p)
+    pre ('\n' :: t) p = line 0 t (Uncons p)
+    pre _           p = Stop
 
 ||| A single line's worth of a plain scalar [spec: ns-plain-one-line],
 ||| assuming the first character of the input starts a plain scalar

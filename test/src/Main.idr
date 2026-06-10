@@ -177,11 +177,55 @@ prop_printedEventIsSingleLine = property $ do
   assert $ all (\c => not $ c `elem` the (List Char) ['\n','\r','\t','\b','\0'])
                (unpack $ printEvent e)
 
+data Lvl = LStr | LDoc | LSeq | LMap
+
+-- Are the events well nested: a single stream of documents, each
+-- holding one node tree, with all collections closed in order?
+balanced : List Event -> Bool
+balanced = go []
+
+  where
+    inNode : List Lvl -> Bool
+    inNode (LDoc :: _) = True
+    inNode (LSeq :: _) = True
+    inNode (LMap :: _) = True
+    inNode _           = False
+
+    go : List Lvl -> List Event -> Bool
+    go []            (StreamStart :: es)    = go [LStr] es
+    go [LStr]        (StreamEnd :: es)      = null es
+    go st@[LStr]     (DocStart _ :: es)     = go (LDoc :: st) es
+    go (LDoc :: st)  (DocEnd _ :: es)       = go st es
+    go st            (SeqStart _ _ _ :: es) = inNode st && go (LSeq :: st) es
+    go (LSeq :: st)  (SeqEnd :: es)         = go st es
+    go st            (MapStart _ _ _ :: es) = inNode st && go (LMap :: st) es
+    go (LMap :: st)  (MapEnd :: es)         = go st es
+    go st            (Scalar _ _ _ _ :: es) = inNode st && go st es
+    go st            (Alias _ :: es)        = inNode st && go st es
+    go _             _                      = False
+
+yamlChar : Gen Char
+yamlChar =
+  frequency
+    [ (10, printableAscii)
+    , (8, element [' ', '\n', ':', '-', '#', '[', ']', '{', '}', ',', '?', '&', '*', '!', '"', '\'', '|', '>'])
+    , (1, unicode)
+    ]
+
+-- Whatever the input, a successful parse yields well nested events.
+prop_parsedEventsBalanced : Property
+prop_parsedEventsBalanced = property $ do
+  s <- forAll (string (linear 0 60) yamlChar)
+  case parseEvents Virtual s of
+    Left _    => assert True
+    Right evs => assert (balanced evs)
+
 properties : Group
 properties =
   MkGroup
     "Text.YAML"
     [ ("prop_printedEventIsSingleLine", prop_printedEventIsSingleLine)
+    , ("prop_parsedEventsBalanced", prop_parsedEventsBalanced)
     ]
 
 covering
