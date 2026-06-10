@@ -23,7 +23,7 @@ into a tree of tagged nodes:
 ```idris
 import Text.YAML
 
-docs : String -> Either YAMLErr (List Node)
+docs : String -> Either (ParseError YErr) (List Node)
 docs = parseDocs Virtual
 
 port : Node -> Maybe Integer
@@ -39,22 +39,34 @@ are interpreted on demand by typed views (`asBool`, `asInteger`,
 `asDouble`, `asString`, ...), so an explicitly tagged `!!int abc`
 composes fine and only fails on access.
 
-Two deliberate deviations worth knowing about: node equality (used for
+Errors - from the parser and the composer alike - carry source spans
+and render as an excerpt of the offending input:
+
+```
+Error: alias *a refers to its own ancestor
+
+virtual: 1:5--1:7
+ 1 | &a [*a]
+         ^^
+```
+
+One deliberate deviation worth knowing about: node equality (used for
 duplicate key detection) compares scalars by tag and raw text, so the
-keys `1` and `0x1` are distinct; and compose errors carry no source
-positions.
+keys `1` and `0x1` are distinct.
 
 The event level is also part of the public API:
 
 ```idris
-events : String -> Either (ParseError YErr) (List Event)
+events : String -> Either (ParseError YErr) (List (Bounded Event))
 events = parseEvents Virtual
 ```
 
 `Event` mirrors the YAML processing model's parse events
 (`StreamStart`, `DocStart`, `SeqStart`, `MapStart`, `Scalar`, `Alias`,
-and their ends). `printEvent` renders an event in the format used by
-the test suite's `test.event` files.
+and their ends), each wrapped with the `Bounds` of the source text it
+covers. `printEvent` renders a bare event in the format used by the
+test suite's `test.event` files, so a stream prints as
+`map (printEvent . val) <$> events s`.
 
 ## Building and testing
 
