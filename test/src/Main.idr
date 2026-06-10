@@ -16,9 +16,8 @@ import Text.YAML
 --          YAML Test Suite Runner
 --------------------------------------------------------------------------------
 
--- Parses a string to YAML events. Stub until `Text.YAML.Parser` lands.
 parseStr : String -> Either String (List Event)
-parseStr _ = Left "YAML parser not yet implemented"
+parseStr = mapFst interpolate . parseEvents Virtual
 
 -- Directory containing the vendored test suite data plus the path
 -- of the known-failures ratchet file.

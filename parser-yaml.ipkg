@@ -7,4 +7,6 @@ depends   = parser
 brief     = "Total parser for the YAML file format"
 
 modules   = Text.YAML
+          , Text.YAML.Lexer
+          , Text.YAML.Parser
           , Text.YAML.Types
