@@ -4,7 +4,7 @@ authors = "mitchmindtree"
 
 depends = yaml
         , hedgehog
-        , parser-json
+        , ilex-json
 
 main = Main
 executable = "yaml-test"

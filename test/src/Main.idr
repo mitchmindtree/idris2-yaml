@@ -54,22 +54,9 @@ mutual
   toPairs acc _                          = Nothing
 
 ||| The suite's in.json files hold one JSON value per document,
-||| concatenated. `parseJSON` rejects trailing content, so accumulating
-||| lines until a prefix parses splits them reliably.
+||| concatenated; `jsonValues` parses exactly that.
 jsonDocs : String -> Maybe (List JSON)
-jsonDocs s = go [<] [<] (lines s)
-
-  where
-    go : SnocList JSON -> SnocList String -> List String -> Maybe (List JSON)
-    go js pend [] =
-      if all (\l => trim l == "") (pend <>> [])
-        then Just (js <>> [])
-        else Nothing
-    go js pend (l :: ls) =
-      let pend2 := pend :< l
-       in case parseJSON Virtual (unlines (pend2 <>> [])) of
-            Right j => go (js :< j) [<] ls
-            Left _  => go js pend2 ls
+jsonDocs s = either (const Nothing) Just (parseString jsonValues Virtual s)
 
 -- JSON equivalence as the suite intends it: object member order is
 -- insignificant (in.json does not preserve the mapping's order), and
