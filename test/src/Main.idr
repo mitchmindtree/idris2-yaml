@@ -44,7 +44,7 @@ findPaths = do
 
   where
     bases : List String
-    bases = map (++ "suite") ["", "test/", "yaml/test/"]
+    bases = map (++ "suite") ["", "test/"]
 
     go : List String -> IO (Maybe Paths)
     go []        = pure Nothing

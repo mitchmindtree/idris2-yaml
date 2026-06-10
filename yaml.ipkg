@@ -1,4 +1,4 @@
-package parser-yaml
+package yaml
 version   = 0.1.0
 authors   = "mitchmindtree"
 sourcedir = "src"
